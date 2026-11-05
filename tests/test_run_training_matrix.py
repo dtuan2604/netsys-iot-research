@@ -32,8 +32,10 @@ def settings(tmp_path: Path, *, model: str) -> runner.RunnerSettings:
         cnn_validation_fraction=0.2,
         cnn_test_trials=100,
         cnn_device="cuda",
-        max_concurrent_experiments=(1 if model == "cnn-pn-rf" else 4),
-        workers_per_experiment=(1 if model == "cnn-pn-rf" else 3),
+        max_concurrent_experiments=(
+            1 if model in {"cnn-pn-rf", "blstm"} else 4
+        ),
+        workers_per_experiment=(1 if model in {"cnn-pn-rf", "blstm"} else 3),
         smoke=False,
     )
 
@@ -69,6 +71,20 @@ def test_default_matrix_has_168_jobs_for_one_model():
     assert len({current.job_id for current in jobs}) == 168
 
 
+def test_blstm_matrix_uses_packet_lengths_and_unique_job_ids():
+    jobs = runner.generate_jobs(
+        ["blstm"],
+        runner.CLASSIFICATION_MODES,
+        runner.BLSTM_SEQUENCE_PACKETS,
+        runner.SPLIT_KINDS,
+    )
+
+    assert len(jobs) == 168
+    assert len({current.job_id for current in jobs}) == 168
+    assert {current.window_seconds for current in jobs} == {20, 40, 100}
+    assert all("sequence-" in current.job_id for current in jobs)
+
+
 def test_smoke_job_uses_v2_unsw_dataset():
     jobs = runner.generate_jobs(
         ["cnn-pn-rf"],
@@ -79,6 +95,13 @@ def test_smoke_job_uses_v2_unsw_dataset():
     )
 
     assert jobs == [runner.ExperimentJob("cnn-pn-rf", "binary", 30, ("NCSU",), "UNSW1")]
+    assert runner.generate_jobs(
+        ["blstm"],
+        runner.CLASSIFICATION_MODES,
+        runner.BLSTM_SEQUENCE_PACKETS,
+        runner.SPLIT_KINDS,
+        smoke=True,
+    ) == [runner.ExperimentJob("blstm", "binary", 20, ("NCSU",), "UNSW1")]
 
 
 def test_removal_counts_cover_every_v2_training_dataset():
@@ -118,8 +141,10 @@ def test_matrix_cli_requires_one_model_and_uses_v2_defaults():
     assert args.features_root == Path("built_features_mac_v2")
     assert args.output_root == Path("output-performance-folder-mac-v2")
     assert args.windows == [5, 10, 30]
+    assert args.sequence_packets == [20, 40, 100]
     assert args.classification_modes == ["binary", "multiclass"]
     assert args.cnn_rf_jobs == -1
+    assert args.blstm_jobs == 1
     assert args.split_kinds == [
         "1-train-1-test",
         "2-train-1-test",
@@ -131,6 +156,23 @@ def test_matrix_cli_requires_one_model_and_uses_v2_defaults():
     )
     with pytest.raises(SystemExit):
         runner.parse_args(["--models", "cnn-pn-rf", "--cnn-rf-jobs", "0"])
+    assert (
+        runner.parse_args(
+            [
+                "--models",
+                "blstm",
+                "--blstm-device",
+                "cpu",
+                "--blstm-jobs",
+                "4",
+            ]
+        ).blstm_jobs
+        == 4
+    )
+    with pytest.raises(SystemExit):
+        runner.parse_args(["--models", "blstm", "--blstm-jobs", "0"])
+    with pytest.raises(SystemExit):
+        runner.parse_args(["--models", "blstm", "--blstm-jobs", "2"])
 
 
 def test_model_specific_scheduling_policy():
@@ -149,6 +191,8 @@ def test_model_specific_scheduling_policy():
         2,
         2,
     )
+    assert runner.scheduling_policy(["blstm"], None, 3) == ("blstm", 1, 1)
+    assert runner.scheduling_policy(["blstm"], None, 3, 4) == ("blstm", 1, 4)
 
 
 @pytest.mark.parametrize(
@@ -156,6 +200,7 @@ def test_model_specific_scheduling_policy():
     [
         (["cnn-pn-rf", "decision-tree"], None),
         (["cnn-pn-rf"], 2),
+        (["blstm"], 2),
         (["decision-tree"], 5),
     ],
 )
@@ -183,6 +228,28 @@ def test_decision_tree_command_has_three_model_workers(tmp_path):
     assert command[1] == str(tmp_path / "code_v2" / "train_decision_tree.py")
     assert option_value(command, "--jobs") == "3"
     assert "taskset" not in command
+
+
+def test_blstm_command_uses_packet_features_and_sequence_output(tmp_path):
+    current = runner.ExperimentJob(
+        "blstm", "multiclass", 40, ("NCSU",), "UNSW1"
+    )
+    config = replace(
+        settings(tmp_path, model="blstm"), blstm_device="cpu", blstm_jobs=4
+    )
+    command = runner.build_command(current, config)
+
+    assert command[1] == str(tmp_path / "code_v2" / "train_lstm.py")
+    assert runner.feature_root(current, config) == (
+        tmp_path / "features" / "multiclass" / "packet_features"
+    )
+    assert runner.job_output_root(current, config).name == "sequence_40packets"
+    assert option_value(command, "--model-type") == "blstm"
+    assert option_value(command, "--sequence-packets") == "40"
+    assert option_value(command, "--test-trials") == "100"
+    assert option_value(command, "--max-sequences-per-device") == "5000"
+    assert option_value(command, "--device") == "cpu"
+    assert option_value(command, "--jobs") == "4"
 
 
 def test_cpu_cnn_runner_adds_bounded_rf_workers(tmp_path):

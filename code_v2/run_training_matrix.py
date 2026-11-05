@@ -18,12 +18,14 @@ from typing import Any, Sequence
 import pyarrow.parquet as pq
 
 import experiment_common as common
+import train_lstm as lstm
 
 
 # These are intentionally plain Python lists/dictionaries so the default matrix is
 # easy to edit before starting a long unattended server run.
 WINDOW_SECONDS = [5, 10, 30]
-MODELS = ["cnn-pn-rf", "decision-tree"]
+BLSTM_SEQUENCE_PACKETS = [20, 40, 100]
+MODELS = ["cnn-pn-rf", "decision-tree", "blstm"]
 CLASSIFICATION_MODES = ["binary", "multiclass"]
 SPLIT_KINDS = ["1-train-1-test", "2-train-1-test", "3-train-1-test"]
 SPLIT_TRAIN_COUNTS = {
@@ -39,17 +41,24 @@ CNN_VALIDATION_FRACTION = 0.2
 CNN_TEST_TRIALS = 100
 CNN_DEVICE = "auto"
 CNN_MAX_CONCURRENT_EXPERIMENTS = 1
+BLSTM_VALIDATION_FRACTION = 0.2
+BLSTM_TEST_TRIALS = 100
+BLSTM_DEVICE = "auto"
+BLSTM_MAX_CONCURRENT_EXPERIMENTS = 1
+BLSTM_MAX_SEQUENCES_PER_DEVICE = 5_000
 DECISION_TREE_MAX_CONCURRENT_EXPERIMENTS = 4
 DECISION_TREE_JOBS = 3
 
 CLASSIFICATION_CONFIG = {
     "binary": {
         "feature_directory": "binary-class",
+        "packet_feature_directory": "binary-class",
         "label_file": "mac_mapping_binary_labels.json",
         "output_directory": "binary-classification",
     },
     "multiclass": {
         "feature_directory": "multi-class",
+        "packet_feature_directory": "multiclass",
         "label_file": "mac_mapping_multi_labels.json",
         "output_directory": "multiclass-classification",
     },
@@ -58,6 +67,7 @@ CLASSIFICATION_CONFIG = {
 MODEL_SCRIPTS = {
     "cnn-pn-rf": "train_cnn_pn_rf.py",
     "decision-tree": "train_decision_tree.py",
+    "blstm": "train_lstm.py",
 }
 
 
@@ -80,8 +90,13 @@ class ExperimentJob:
     @property
     def job_id(self) -> str:
         train = "+".join(self.train_datasets)
+        context = (
+            f"sequence-{self.window_seconds}packets"
+            if self.model == "blstm"
+            else f"window-{self.window_seconds}s"
+        )
         return (
-            f"{self.model}__{self.classification}__window-{self.window_seconds}s__"
+            f"{self.model}__{self.classification}__{context}__"
             f"train-{train}__test-{self.test_dataset}"
         )
 
@@ -102,6 +117,11 @@ class RunnerSettings:
     workers_per_experiment: int
     smoke: bool
     cnn_rf_jobs: int = -1
+    blstm_validation_fraction: float = BLSTM_VALIDATION_FRACTION
+    blstm_test_trials: int = BLSTM_TEST_TRIALS
+    blstm_device: str = BLSTM_DEVICE
+    blstm_max_sequences_per_device: int = BLSTM_MAX_SEQUENCES_PER_DEVICE
+    blstm_jobs: int = 1
 
 
 def utc_now() -> str:
@@ -138,7 +158,14 @@ def generate_jobs(
 ) -> list[ExperimentJob]:
     if smoke:
         return [
-            ExperimentJob(model, "binary", 30, ("NCSU",), "UNSW1") for model in models
+            ExperimentJob(
+                model,
+                "binary",
+                20 if model == "blstm" else 30,
+                ("NCSU",),
+                "UNSW1",
+            )
+            for model in models
         ]
     splits = directional_splits(split_kinds)
     return [
@@ -151,6 +178,11 @@ def generate_jobs(
 
 
 def feature_root(job: ExperimentJob, settings: RunnerSettings) -> Path:
+    if job.model == "blstm":
+        feature_directory = CLASSIFICATION_CONFIG[job.classification][
+            "packet_feature_directory"
+        ]
+        return settings.features_root / feature_directory / "packet_features"
     feature_directory = CLASSIFICATION_CONFIG[job.classification]["feature_directory"]
     return settings.features_root / feature_directory / f"window_{job.window_seconds}s"
 
@@ -159,7 +191,12 @@ def job_output_root(job: ExperimentJob, settings: RunnerSettings) -> Path:
     classification_directory = CLASSIFICATION_CONFIG[job.classification][
         "output_directory"
     ]
-    return settings.output_root / job.model / classification_directory / job.split_kind
+    root = settings.output_root / job.model / classification_directory / job.split_kind
+    return (
+        root / f"sequence_{job.window_seconds}packets"
+        if job.model == "blstm"
+        else root
+    )
 
 
 def removal_specs(job: ExperimentJob) -> list[dict[str, Any]]:
@@ -187,17 +224,23 @@ def scheduling_policy(
     models: Sequence[str],
     requested_concurrency: int | None,
     decision_tree_jobs: int,
+    blstm_jobs: int = 1,
 ) -> tuple[str, int, int]:
     selected = list(dict.fromkeys(models))
     if len(selected) != 1:
         raise MatrixError(
-            "select exactly one model per matrix invocation; CNN-PN-RF and "
-            "decision-tree matrices must run separately"
+            "select exactly one model per matrix invocation; CNN-PN-RF, BLSTM, "
+            "and decision-tree matrices must run separately"
         )
     model = selected[0]
     if model == "cnn-pn-rf":
         maximum = CNN_MAX_CONCURRENT_EXPERIMENTS
         workers = 1
+    elif model == "blstm":
+        maximum = BLSTM_MAX_CONCURRENT_EXPERIMENTS
+        if blstm_jobs <= 0:
+            raise MatrixError("--blstm-jobs must be a positive integer")
+        workers = blstm_jobs
     elif model == "decision-tree":
         maximum = DECISION_TREE_MAX_CONCURRENT_EXPERIMENTS
         if decision_tree_jobs not in (2, 3):
@@ -275,6 +318,36 @@ def build_command(
                     "4096",
                 ]
             )
+    elif job.model == "blstm":
+        command.extend(
+            [
+                "--model-type",
+                "blstm",
+                "--sequence-packets",
+                str(job.window_seconds),
+                "--validation-fraction",
+                str(settings.blstm_validation_fraction),
+                "--test-trials",
+                str(settings.blstm_test_trials),
+                "--device",
+                settings.blstm_device,
+                "--max-sequences-per-device",
+                str(20 if settings.smoke else settings.blstm_max_sequences_per_device),
+                "--jobs",
+                str(settings.blstm_jobs),
+            ]
+        )
+        if settings.smoke:
+            command.extend(
+                [
+                    "--max-epochs",
+                    "1",
+                    "--patience",
+                    "1",
+                    "--batch-size",
+                    "16",
+                ]
+            )
     else:
         command.extend(["--jobs", str(settings.workers_per_experiment)])
     if settings.stop_file is not None:
@@ -292,11 +365,13 @@ def validate_job_inputs(
         root_key = (job.classification, job.window_seconds)
         if root_key not in checked_roots:
             label_file = str(CLASSIFICATION_CONFIG[job.classification]["label_file"])
-            common.validate_mac_feature_manifest(
-                feature_root(job, settings),
-                settings.labels_root,
-                label_file,
-                common.DATASETS,
+            validator = (
+                lstm.validate_packet_feature_manifest
+                if job.model == "blstm"
+                else common.validate_mac_feature_manifest
+            )
+            validator(
+                feature_root(job, settings), settings.labels_root, label_file, common.DATASETS
             )
             checked_roots.add(root_key)
 
@@ -352,7 +427,7 @@ def trainer_status(experiment_dir: Path) -> str | None:
 def matrix_configuration(
     jobs: Sequence[ExperimentJob], settings: RunnerSettings
 ) -> dict[str, Any]:
-    return {
+    configuration = {
         "jobs": [asdict(job) for job in jobs],
         "features_root": str(settings.features_root),
         "labels_root": str(settings.labels_root),
@@ -369,6 +444,19 @@ def matrix_configuration(
         "workers_per_experiment": settings.workers_per_experiment,
         "smoke": settings.smoke,
     }
+    if jobs and jobs[0].model == "blstm":
+        configuration.update(
+            {
+                "blstm_validation_fraction": settings.blstm_validation_fraction,
+                "blstm_test_trials": settings.blstm_test_trials,
+                "blstm_device": settings.blstm_device,
+                "blstm_max_sequences_per_device": (
+                    settings.blstm_max_sequences_per_device
+                ),
+                "blstm_jobs": settings.blstm_jobs,
+            }
+        )
+    return configuration
 
 
 def fingerprint_configuration(configuration: dict[str, Any]) -> dict[str, Any]:
@@ -383,6 +471,7 @@ def fingerprint_configuration(configuration: dict[str, Any]) -> dict[str, Any]:
         "cnn_rf_jobs",
         "decision_tree_jobs",
         "workers_per_experiment",
+        "blstm_jobs",
     }
     return {
         key: value for key, value in configuration.items() if key not in scheduling_keys
@@ -646,6 +735,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--windows", type=int, nargs="+", default=WINDOW_SECONDS)
     parser.add_argument(
+        "--sequence-packets",
+        type=int,
+        nargs="+",
+        default=BLSTM_SEQUENCE_PACKETS,
+        help="packet-sequence lengths used by the BLSTM matrix",
+    )
+    parser.add_argument(
         "--models",
         nargs=1,
         choices=MODELS,
@@ -673,6 +769,31 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=CNN_DEVICE,
     )
     parser.add_argument(
+        "--blstm-validation-fraction",
+        type=float,
+        default=BLSTM_VALIDATION_FRACTION,
+    )
+    parser.add_argument("--blstm-test-trials", type=int, default=BLSTM_TEST_TRIALS)
+    parser.add_argument(
+        "--blstm-device",
+        choices=("auto", "cpu", "cuda", "mps", "xpu"),
+        default=BLSTM_DEVICE,
+    )
+    parser.add_argument(
+        "--blstm-max-sequences-per-device",
+        type=int,
+        default=BLSTM_MAX_SEQUENCES_PER_DEVICE,
+    )
+    parser.add_argument(
+        "--blstm-jobs",
+        type=int,
+        default=1,
+        help=(
+            "parallel device-removal model runs within each BLSTM experiment; "
+            "values above 1 require --blstm-device cpu"
+        ),
+    )
+    parser.add_argument(
         "--cnn-rf-jobs",
         type=int,
         default=-1,
@@ -682,8 +803,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--max-concurrent-experiments",
         type=int,
         help=(
-            "simultaneous trainer processes; defaults to 1 for CNN-PN-RF and 4 "
-            "for decision tree"
+            "simultaneous trainer processes; defaults to 1 for CNN-PN-RF/BLSTM "
+            "and 4 for decision tree"
         ),
     )
     parser.add_argument(
@@ -707,6 +828,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.cnn_rf_jobs == 0 or args.cnn_rf_jobs < -1:
         parser.error("--cnn-rf-jobs must be -1 or a positive integer")
+    if any(value <= 0 for value in args.sequence_packets):
+        parser.error("--sequence-packets values must be positive")
+    if args.blstm_test_trials <= 0 or args.blstm_max_sequences_per_device <= 0:
+        parser.error("BLSTM trials and sequence cap must be positive")
+    if args.blstm_jobs <= 0:
+        parser.error("--blstm-jobs must be a positive integer")
+    if (
+        args.models == ["blstm"]
+        and args.blstm_jobs > 1
+        and args.blstm_device != "cpu"
+    ):
+        parser.error("--blstm-jobs greater than 1 requires --blstm-device cpu")
+    if not 0 < args.blstm_validation_fraction < 1:
+        parser.error("--blstm-validation-fraction must be between zero and one")
     return args
 
 
@@ -722,6 +857,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.models,
             args.max_concurrent_experiments,
             args.decision_tree_jobs,
+            args.blstm_jobs,
         )
         stop_file = resolve_from_repo(args.stop_file) if args.stop_file else None
         settings = RunnerSettings(
@@ -736,6 +872,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             cnn_test_trials=2 if args.smoke else args.cnn_test_trials,
             cnn_device=args.cnn_device,
             cnn_rf_jobs=args.cnn_rf_jobs,
+            blstm_validation_fraction=args.blstm_validation_fraction,
+            blstm_test_trials=2 if args.smoke else args.blstm_test_trials,
+            blstm_device=args.blstm_device,
+            blstm_max_sequences_per_device=(
+                20 if args.smoke else args.blstm_max_sequences_per_device
+            ),
+            blstm_jobs=args.blstm_jobs,
             max_concurrent_experiments=concurrency,
             workers_per_experiment=workers_per_experiment,
             smoke=args.smoke,
@@ -743,7 +886,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         jobs = generate_jobs(
             args.models,
             args.classification_modes,
-            args.windows,
+            args.sequence_packets if args.models == ["blstm"] else args.windows,
             args.split_kinds,
             smoke=args.smoke,
         )

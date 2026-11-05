@@ -13,3 +13,4 @@ training-*.log
 output-performance-cnn-macbook-mps-mac
 output-performance-*/
 built_features_mac_*/
+*.log
