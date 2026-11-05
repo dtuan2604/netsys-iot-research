@@ -119,11 +119,18 @@ def test_matrix_cli_requires_one_model_and_uses_v2_defaults():
     assert args.output_root == Path("output-performance-folder-mac-v2")
     assert args.windows == [5, 10, 30]
     assert args.classification_modes == ["binary", "multiclass"]
+    assert args.cnn_rf_jobs == -1
     assert args.split_kinds == [
         "1-train-1-test",
         "2-train-1-test",
         "3-train-1-test",
     ]
+    assert (
+        runner.parse_args(["--models", "cnn-pn-rf", "--cnn-rf-jobs", "4"]).cnn_rf_jobs
+        == 4
+    )
+    with pytest.raises(SystemExit):
+        runner.parse_args(["--models", "cnn-pn-rf", "--cnn-rf-jobs", "0"])
 
 
 def test_model_specific_scheduling_policy():
@@ -157,14 +164,14 @@ def test_invalid_scheduling_policy_is_rejected(models, concurrency):
         runner.scheduling_policy(models, concurrency, 3)
 
 
-def test_cnn_command_has_one_model_worker_and_no_cpu_assignment(tmp_path):
+def test_cnn_command_has_one_model_worker_and_configurable_rf_workers(tmp_path):
     command = runner.build_command(
         job("cnn-pn-rf"), settings(tmp_path, model="cnn-pn-rf")
     )
 
     assert command[1] == str(tmp_path / "code_v2" / "train_cnn_pn_rf.py")
     assert option_value(command, "--jobs") == "1"
-    assert "--rf-jobs" not in command
+    assert option_value(command, "--rf-jobs") == "-1"
     assert "taskset" not in command
 
 

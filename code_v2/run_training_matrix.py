@@ -101,6 +101,7 @@ class RunnerSettings:
     max_concurrent_experiments: int
     workers_per_experiment: int
     smoke: bool
+    cnn_rf_jobs: int = -1
 
 
 def utc_now() -> str:
@@ -255,6 +256,8 @@ def build_command(
                 str(settings.cnn_test_trials),
                 "--device",
                 settings.cnn_device,
+                "--rf-jobs",
+                str(settings.cnn_rf_jobs),
                 "--jobs",
                 "1",
             ]
@@ -361,6 +364,7 @@ def matrix_configuration(
         "cnn_validation_fraction": settings.cnn_validation_fraction,
         "cnn_test_trials": settings.cnn_test_trials,
         "cnn_device": settings.cnn_device,
+        "cnn_rf_jobs": settings.cnn_rf_jobs,
         "max_concurrent_experiments": settings.max_concurrent_experiments,
         "workers_per_experiment": settings.workers_per_experiment,
         "smoke": settings.smoke,
@@ -376,6 +380,7 @@ def fingerprint_configuration(configuration: dict[str, Any]) -> dict[str, Any]:
         "memory_target_percent",
         "memory_per_experiment_gb",
         "max_concurrent_experiments",
+        "cnn_rf_jobs",
         "decision_tree_jobs",
         "workers_per_experiment",
     }
@@ -668,6 +673,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=CNN_DEVICE,
     )
     parser.add_argument(
+        "--cnn-rf-jobs",
+        type=int,
+        default=-1,
+        help="Random Forest workers within each CNN experiment; -1 uses all CPUs",
+    )
+    parser.add_argument(
         "--max-concurrent-experiments",
         type=int,
         help=(
@@ -693,7 +704,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     lifecycle = parser.add_mutually_exclusive_group()
     lifecycle.add_argument("--resume", action="store_true")
     lifecycle.add_argument("--overwrite", action="store_true")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.cnn_rf_jobs == 0 or args.cnn_rf_jobs < -1:
+        parser.error("--cnn-rf-jobs must be -1 or a positive integer")
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -721,6 +735,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             cnn_validation_fraction=args.cnn_validation_fraction,
             cnn_test_trials=2 if args.smoke else args.cnn_test_trials,
             cnn_device=args.cnn_device,
+            cnn_rf_jobs=args.cnn_rf_jobs,
             max_concurrent_experiments=concurrency,
             workers_per_experiment=workers_per_experiment,
             smoke=args.smoke,

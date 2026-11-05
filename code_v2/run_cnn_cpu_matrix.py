@@ -26,11 +26,7 @@ def build_cpu_command(
 ) -> list[str]:
     """Build the standard CNN command with a bounded Random Forest worker count."""
     command = STANDARD_BUILD_COMMAND(job, settings, lifecycle)
-    rf_arguments = ["--rf-jobs", str(rf_jobs)]
-    if lifecycle is None:
-        command.extend(rf_arguments)
-    else:
-        command[-1:-1] = rf_arguments
+    command[command.index("--rf-jobs") + 1] = str(rf_jobs)
     return command
 
 
