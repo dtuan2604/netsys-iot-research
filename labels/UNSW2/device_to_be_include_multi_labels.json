@@ -1,0 +1,18 @@
+{
+    "18:b7:9e:02:20:44": {"device_name": "Triby Speaker", "ip_address": null, "is_iot_device": 1, "device_type": "smart speaker", "vendor": "Invoxia"},
+    "74:c6:3b:29:d7:1d": {"device_name": "iHome", "ip_address": null, "is_iot_device": 1, "device_type": "smart home device", "vendor": "iHome"},
+    "50:c7:bf:00:56:39": {"device_name": "TP-Link Smart plug", "ip_address": null, "is_iot_device": 1, "device_type": "smart plug", "vendor": "TP-Link"},
+    "70:5a:0f:e4:9b:c0": {"device_name": "HP Printer", "ip_address": null, "is_iot_device": 1, "device_type": "printer", "vendor": "HP"},
+    "00:16:6c:ab:6b:88": {"device_name": "Samsung SmartCam", "ip_address": null, "is_iot_device": 1, "device_type": "camera", "vendor": "Samsung"},
+    "d0:73:d5:01:83:08": {"device_name": "Light Bulbs LiFX Smart Bulb", "ip_address": null, "is_iot_device": 1, "device_type": "smart bulb", "vendor": "LIFX"},
+    "e8:ab:fa:19:de:4f": {"device_name": "Insteon Camera", "ip_address": null, "is_iot_device": 1, "device_type": "camera", "vendor": "Insteon"},
+    "00:24:e4:11:18:a8": {"device_name": "Withings Smart Baby Monitor", "ip_address": null, "is_iot_device": 1, "device_type": "baby monitor", "vendor": "Withings"},
+    "d0:52:a8:00:67:5e": {"device_name": "Smart Things", "ip_address": null, "is_iot_device": 1, "device_type": "smart home hub", "vendor": "Samsung SmartThings"},
+    "f4:f2:6d:93:51:f1": {"device_name": "TP-Link Day Night Cloud camera", "ip_address": null, "is_iot_device": 1, "device_type": "camera", "vendor": "TP-Link"},
+    "e0:76:d0:33:bb:85": {"device_name": "PIX-STAR Photo-frame", "ip_address": null, "is_iot_device": 1, "device_type": "digital photo frame", "vendor": "Pix-Star"},
+    "ac:bc:32:d4:6f:2f": {"device_name": "MacBook", "ip_address": null, "is_iot_device": 0, "device_type": "laptop", "vendor": "Apple"},
+    "b4:ce:f6:a7:a3:c2": {"device_name": "Android Phone 2", "ip_address": null, "is_iot_device": 0, "device_type": "smartphone", "vendor": "Unknown"},
+    "f4:5c:89:93:cc:85": {"device_name": "MacBook/Iphone", "ip_address": null, "is_iot_device": 0, "device_type": "laptop or smartphone", "vendor": "Apple"},
+    "d0:a6:37:df:a1:e1": {"device_name": "IPhone", "ip_address": null, "is_iot_device": 0, "device_type": "smartphone", "vendor": "Apple"},
+    "14:cc:20:51:33:ea": {"device_name": "TPLink Router Bridge LAN (Gateway)", "ip_address": null, "is_iot_device": 2, "device_type": "router/gateway", "vendor": "TP-Link"}
+}

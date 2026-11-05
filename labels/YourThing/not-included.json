@@ -1,0 +1,96 @@
+{
+,
+    "192.168.0.16": {
+        "device_name": "WinkHub",
+        "ip_address": "192.168.0.16",
+        "is_iot_device": 1,
+        "device_type": "smart home hub",
+        "vendor": "Wink"
+    },
+    "192.168.0.17": {
+        "device_name": "NestProtect",
+        "ip_address": "192.168.0.17",
+        "is_iot_device": 1,
+        "device_type": "smoke and carbon monoxide detector",
+        "vendor": "Nest"
+    },
+    "192.168.0.55": {
+        "device_name": "NestBell",
+        "ip_address": "192.168.0.55",
+        "is_iot_device": 1,
+        "device_type": "video doorbell",
+        "vendor": "Nest"
+    },
+    "192.168.0.56": {
+        "device_name": "Rachio3",
+        "ip_address": "192.168.0.56",
+        "is_iot_device": 1,
+        "device_type": "smart sprinkler controller",
+        "vendor": "Rachio"
+    },
+    "192.168.0.57": {
+        "device_name": "AmazonEchoDotGen3",
+        "ip_address": "192.168.0.57",
+        "is_iot_device": 1,
+        "device_type": "smart speaker",
+        "vendor": "Amazon"
+    },
+    "192.168.0.58": {
+        "device_name": "NestThermostat",
+        "ip_address": "192.168.0.58",
+        "is_iot_device": 1,
+        "device_type": "smart thermostat",
+        "vendor": "Nest"
+    },
+    "192.168.0.59": {
+        "device_name": "GoogleHomeHub",
+        "ip_address": "192.168.0.59",
+        "is_iot_device": 1,
+        "device_type": "smart display",
+        "vendor": "Google"
+    },
+    
+    "192.168.0.62": {
+        "device_name": "FacebookPortal",
+        "ip_address": "192.168.0.62",
+        "is_iot_device": 1,
+        "device_type": "smart display",
+        "vendor": "Facebook"
+    },
+    "192.168.0.63": {
+        "device_name": "SonosBeam",
+        "ip_address": "192.168.0.63",
+        "is_iot_device": 1,
+        "device_type": "smart soundbar",
+        "vendor": "Sonos"
+    },
+    "192.168.0.64": {
+        "device_name": "LGWebOSTV",
+        "ip_address": "192.168.0.64",
+        "is_iot_device": 1,
+        "device_type": "smart TV",
+        "vendor": "LG"
+    },
+    "192.168.0.65": {
+        "device_name": "MyCloudEX2Ultra",
+        "ip_address": "192.168.0.65",
+        "is_iot_device": 0,
+        "device_type": "network attached storage",
+        "vendor": "Western Digital"
+    },
+    "192.168.0.67": {
+        "device_name": "AxisNetworkCamera",
+        "ip_address": "192.168.0.67",
+        "is_iot_device": 1,
+        "device_type": "camera",
+        "vendor": "Axis Communications"
+    },
+    "192.168.0.68": {
+        "device_name": "AVTechIPCam",
+        "ip_address": "192.168.0.68",
+        "is_iot_device": 1,
+        "device_type": "camera",
+        "vendor": "AVTECH"
+    },
+    
+}

@@ -1,0 +1,100 @@
+{
+    "192.168.1.125": {
+        "device_name": "Amazon Echo Plus 2nd Gen",
+        "ip_address": "192.168.1.125",
+        "is_iot_device": 1,
+        "device_type": "smart speaker",
+        "vendor": "Amazon"
+    },
+    "192.168.1.135": {
+        "device_name": "Desktop",
+        "ip_address": "192.168.1.135",
+        "is_iot_device": 0,
+        "device_type": "desktop computer",
+        "vendor": "Unknown"
+    },
+    "192.168.1.1": {
+        "device_name": "Router",
+        "ip_address": "192.168.1.1",
+        "is_iot_device": 0,
+        "device_type": "router",
+        "vendor": "Unknown"
+    },
+    "192.168.1.134": {
+        "device_name": "Amazon Echo Look",
+        "ip_address": "192.168.1.134",
+        "is_iot_device": 1,
+        "device_type": "smart camera",
+        "vendor": "Amazon"
+    },
+    "192.168.1.113": {
+        "device_name": "Nestcam",
+        "ip_address": "192.168.1.113",
+        "is_iot_device": 1,
+        "device_type": "camera",
+        "vendor": "Nest"
+    },
+    "192.168.1.249": {
+        "device_name": "Google OnHub",
+        "ip_address": "192.168.1.249",
+        "is_iot_device": 0,
+        "device_type": "router",
+        "vendor": "Google"
+    },
+    "192.168.1.106": {
+        "device_name": "Ring Doorbell",
+        "ip_address": "192.168.1.106",
+        "is_iot_device": 1,
+        "device_type": "smart doorbell",
+        "vendor": "Ring"
+    },
+    "192.168.1.164": {
+        "device_name": "Samsung SmartThings Hub 2",
+        "ip_address": "192.168.1.164",
+        "is_iot_device": 1,
+        "device_type": "smart home hub",
+        "vendor": "Samsung SmartThings"
+    },
+    "192.168.1.118": {
+        "device_name": "Smart WiFi Plug",
+        "ip_address": "192.168.1.118",
+        "is_iot_device": 1,
+        "device_type": "smart plug",
+        "vendor": "Unknown"
+    },
+    "192.168.1.163": {
+        "device_name": "Smart WiFi Plug",
+        "ip_address": "192.168.1.163",
+        "is_iot_device": 1,
+        "device_type": "smart plug",
+        "vendor": "Unknown"
+    },
+    "192.168.1.103": {
+        "device_name": "LG Smart TV",
+        "ip_address": "192.168.1.103",
+        "is_iot_device": 1,
+        "device_type": "smart TV",
+        "vendor": "LG"
+    },
+    "192.168.1.131": {
+        "device_name": "Amcrest Camera",
+        "ip_address": "192.168.1.131",
+        "is_iot_device": 1,
+        "device_type": "camera",
+        "vendor": "Amcrest"
+    },
+    "192.168.1.153": {
+        "device_name": "Foscam",
+        "ip_address": "192.168.1.153",
+        "is_iot_device": 1,
+        "device_type": "camera",
+        "vendor": "Foscam"
+    },
+    "192.168.1.224": {
+        "device_name": "Pixel 2 Phone",
+        "ip_address": "192.168.1.224",
+        "is_iot_device": 0,
+        "device_type": "smartphone",
+        "vendor": "Google"
+    }
+}

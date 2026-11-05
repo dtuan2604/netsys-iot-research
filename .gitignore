@@ -1,0 +1,15 @@
+built_features_mac/
+built_feature*.tar*
+**/__pycache__/
+output-performance-folder-mac/
+smoke-output-performance-folder-mac/
+smoke-output-performance-*-mac/
+output-performance-cnn-mac/
+output-performance-decision-tree-mac/
+training-matrix*.stop
+.discord-webhook-url
+training-matrix*.pid
+training-*.log
+output-performance-cnn-macbook-mps-mac
+output-performance-*/
+built_features_mac_*/

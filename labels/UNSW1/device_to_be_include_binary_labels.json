@@ -1,0 +1,18 @@
+{
+    "74:6a:89:00:2e:25": {"device_name": "Blipcare Blood Pressure meter", "ip_address": null, "is_iot_device": 1, "device_type": "blood pressure monitor", "vendor": "Blipcare"},
+    "00:24:e4:1b:6f:96": {"device_name": "Withings Smart scale", "ip_address": null, "is_iot_device": 1, "device_type": "smart scale", "vendor": "Withings"},
+    "70:ee:50:18:34:43": {"device_name": "Netatmo Welcome", "ip_address": null, "is_iot_device": 1, "device_type": "camera", "vendor": "Netatmo"},
+    "70:ee:50:03:b8:ac": {"device_name": "Netatmo weather station", "ip_address": null, "is_iot_device": 1, "device_type": "weather station", "vendor": "Netatmo"},
+    "30:8c:fb:2f:e4:b2": {"device_name": "Dropcam", "ip_address": null, "is_iot_device": 1, "device_type": "camera", "vendor": "Dropcam"},
+    "18:b4:30:25:be:e4": {"device_name": "NEST Protect smoke alarm", "ip_address": null, "is_iot_device": 1, "device_type": "smoke alarm", "vendor": "Nest"},
+    "00:24:e4:20:28:c6": {"device_name": "Withings Aura smart sleep sensor", "ip_address": null, "is_iot_device": 1, "device_type": "sleep sensor", "vendor": "Withings"},
+    "ec:1a:59:83:28:11": {"device_name": "Belkin wemo motion sensor", "ip_address": null, "is_iot_device": 1, "device_type": "motion sensor", "vendor": "Belkin"},
+    "30:8c:fb:b6:ea:45": {"device_name": "Nest Dropcam", "ip_address": null, "is_iot_device": 1, "device_type": "camera", "vendor": "Nest"},
+    "00:62:6e:51:27:2e": {"device_name": "Insteon Camera", "ip_address": null, "is_iot_device": 1, "device_type": "camera", "vendor": "Insteon"},
+    "ec:1a:59:79:f4:89": {"device_name": "Belkin Wemo switch", "ip_address": null, "is_iot_device": 1, "device_type": "smart switch", "vendor": "Belkin"},
+    "44:65:0d:56:cc:d3": {"device_name": "Amazon Echo", "ip_address": null, "is_iot_device": 1, "device_type": "smart speaker", "vendor": "Amazon"},
+    "74:2f:68:81:69:42": {"device_name": "Laptop", "ip_address": null, "is_iot_device": 0, "device_type": "laptop", "vendor": "Unknown"},
+    "40:f3:08:ff:1e:da": {"device_name": "Android Phone 1", "ip_address": null, "is_iot_device": 0, "device_type": "smartphone", "vendor": "Unknown"},
+    "08:21:ef:3b:fc:e3": {"device_name": "Samsung Galaxy Tab", "ip_address": null, "is_iot_device": 0, "device_type": "tablet", "vendor": "Samsung"},
+    "14:cc:20:51:33:ea": {"device_name": "TPLink Router Bridge LAN (Gateway)", "ip_address": null, "is_iot_device": 0, "device_type": "router/gateway", "vendor": "TP-Link"}
+}

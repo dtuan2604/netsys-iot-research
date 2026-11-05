@@ -1,0 +1,219 @@
+{
+    "d0:52:a8:00:67:5e": {
+        "device_name": "Smart Things",
+        "ip_address": null,
+        "is_iot_device": 1,
+        "device_type": "smart home hub",
+        "vendor": "Samsung SmartThings"
+    },
+    "44:65:0d:56:cc:d3": {
+        "device_name": "Amazon Echo",
+        "ip_address": null,
+        "is_iot_device": 1,
+        "device_type": "smart speaker",
+        "vendor": "Amazon"
+    },
+    "70:ee:50:18:34:43": {
+        "device_name": "Netatmo Welcome",
+        "ip_address": null,
+        "is_iot_device": 1,
+        "device_type": "camera",
+        "vendor": "Netatmo"
+    },
+    "f4:f2:6d:93:51:f1": {
+        "device_name": "TP-Link Day Night Cloud camera",
+        "ip_address": null,
+        "is_iot_device": 1,
+        "device_type": "camera",
+        "vendor": "TP-Link"
+    },
+    "00:16:6c:ab:6b:88": {
+        "device_name": "Samsung SmartCam",
+        "ip_address": null,
+        "is_iot_device": 1,
+        "device_type": "camera",
+        "vendor": "Samsung"
+    },
+    "30:8c:fb:2f:e4:b2": {
+        "device_name": "Dropcam",
+        "ip_address": null,
+        "is_iot_device": 1,
+        "device_type": "camera",
+        "vendor": "Dropcam"
+    },
+    "00:62:6e:51:27:2e": {
+        "device_name": "Insteon Camera",
+        "ip_address": null,
+        "is_iot_device": 1,
+        "device_type": "camera",
+        "vendor": "Insteon"
+    },
+    "e8:ab:fa:19:de:4f": {
+        "device_name": "Insteon Camera",
+        "ip_address": null,
+        "is_iot_device": 1,
+        "device_type": "camera",
+        "vendor": "Insteon"
+    },
+    "00:24:e4:11:18:a8": {
+        "device_name": "Withings Smart Baby Monitor",
+        "ip_address": null,
+        "is_iot_device": 1,
+        "device_type": "baby monitor",
+        "vendor": "Withings"
+    },
+    "ec:1a:59:79:f4:89": {
+        "device_name": "Belkin Wemo switch",
+        "ip_address": null,
+        "is_iot_device": 1,
+        "device_type": "smart switch",
+        "vendor": "Belkin"
+    },
+    "50:c7:bf:00:56:39": {
+        "device_name": "TP-Link Smart plug",
+        "ip_address": null,
+        "is_iot_device": 1,
+        "device_type": "smart plug",
+        "vendor": "TP-Link"
+    },
+    "74:c6:3b:29:d7:1d": {
+        "device_name": "iHome",
+        "ip_address": null,
+        "is_iot_device": 1,
+        "device_type": "smart home device",
+        "vendor": "iHome"
+    },
+    "ec:1a:59:83:28:11": {
+        "device_name": "Belkin wemo motion sensor",
+        "ip_address": null,
+        "is_iot_device": 1,
+        "device_type": "motion sensor",
+        "vendor": "Belkin"
+    },
+    "18:b4:30:25:be:e4": {
+        "device_name": "NEST Protect smoke alarm",
+        "ip_address": null,
+        "is_iot_device": 1,
+        "device_type": "smoke alarm",
+        "vendor": "Nest"
+    },
+    "70:ee:50:03:b8:ac": {
+        "device_name": "Netatmo weather station",
+        "ip_address": null,
+        "is_iot_device": 1,
+        "device_type": "weather station",
+        "vendor": "Netatmo"
+    },
+    "00:24:e4:1b:6f:96": {
+        "device_name": "Withings Smart scale",
+        "ip_address": null,
+        "is_iot_device": 1,
+        "device_type": "smart scale",
+        "vendor": "Withings"
+    },
+    "74:6a:89:00:2e:25": {
+        "device_name": "Blipcare Blood Pressure meter",
+        "ip_address": null,
+        "is_iot_device": 1,
+        "device_type": "blood pressure monitor",
+        "vendor": "Blipcare"
+    },
+    "00:24:e4:20:28:c6": {
+        "device_name": "Withings Aura smart sleep sensor",
+        "ip_address": null,
+        "is_iot_device": 1,
+        "device_type": "sleep sensor",
+        "vendor": "Withings"
+    },
+    "d0:73:d5:01:83:08": {
+        "device_name": "Light Bulbs LiFX Smart Bulb",
+        "ip_address": null,
+        "is_iot_device": 1,
+        "device_type": "smart bulb",
+        "vendor": "LIFX"
+    },
+    "18:b7:9e:02:20:44": {
+        "device_name": "Triby Speaker",
+        "ip_address": null,
+        "is_iot_device": 1,
+        "device_type": "smart speaker",
+        "vendor": "Invoxia"
+    },
+    "e0:76:d0:33:bb:85": {
+        "device_name": "PIX-STAR Photo-frame",
+        "ip_address": null,
+        "is_iot_device": 1,
+        "device_type": "digital photo frame",
+        "vendor": "Pix-Star"
+    },
+    "70:5a:0f:e4:9b:c0": {
+        "device_name": "HP Printer",
+        "ip_address": null,
+        "is_iot_device": 1,
+        "device_type": "printer",
+        "vendor": "HP"
+    },
+    "08:21:ef:3b:fc:e3": {
+        "device_name": "Samsung Galaxy Tab",
+        "ip_address": null,
+        "is_iot_device": 0,
+        "device_type": "tablet",
+        "vendor": "Samsung"
+    },
+    "30:8c:fb:b6:ea:45": {
+        "device_name": "Nest Dropcam",
+        "ip_address": null,
+        "is_iot_device": 1,
+        "device_type": "camera",
+        "vendor": "Nest"
+    },
+    "40:f3:08:ff:1e:da": {
+        "device_name": "Android Phone 1",
+        "ip_address": null,
+        "is_iot_device": 0,
+        "device_type": "smartphone",
+        "vendor": "Unknown"
+    },
+    "74:2f:68:81:69:42": {
+        "device_name": "Laptop",
+        "ip_address": null,
+        "is_iot_device": 0,
+        "device_type": "laptop",
+        "vendor": "Unknown"
+    },
+    "ac:bc:32:d4:6f:2f": {
+        "device_name": "MacBook",
+        "ip_address": null,
+        "is_iot_device": 0,
+        "device_type": "laptop",
+        "vendor": "Apple"
+    },
+    "b4:ce:f6:a7:a3:c2": {
+        "device_name": "Android Phone 2",
+        "ip_address": null,
+        "is_iot_device": 0,
+        "device_type": "smartphone",
+        "vendor": "Unknown"
+    },
+    "d0:a6:37:df:a1:e1": {
+        "device_name": "IPhone",
+        "ip_address": null,
+        "is_iot_device": 0,
+        "device_type": "smartphone",
+        "vendor": "Apple"
+    },
+    "f4:5c:89:93:cc:85": {
+        "device_name": "MacBook/Iphone",
+        "ip_address": null,
+        "is_iot_device": 0,
+        "device_type": "laptop or smartphone",
+        "vendor": "Apple"
+    },
+    "14:cc:20:51:33:ea": {
+        "device_name": "TPLink Router Bridge LAN (Gateway)",
+        "ip_address": null,
+        "is_iot_device": 2,
+        "device_type": "router/gateway",
+        "vendor": "TP-Link"
+    }
+}
