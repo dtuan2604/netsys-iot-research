@@ -123,6 +123,14 @@ def write_packet_fixture(
         inventory[dataset] = {
             "identifier_type": "mac",
             "label_sha256": hashlib.sha256(raw).hexdigest(),
+            "dates": {
+                capture_id: {
+                    "status": "complete",
+                    "row_counts": {device_id: 4 for device_id in labels},
+                }
+                for capture_id in ("24-01-01", "24-01-02")
+            },
+            "devices": {},
         }
         for device_id, metadata in labels.items():
             rows = packet_rows(
@@ -134,8 +142,12 @@ def write_packet_fixture(
             path = root / dataset / device_id / "features.parquet"
             path.parent.mkdir(parents=True, exist_ok=True)
             pq.write_table(
-                pa.Table.from_pylist(rows, schema=packet_schema()), path
+                pa.Table.from_pylist(rows, schema=packet_schema()), path, row_group_size=3
             )
+            inventory[dataset]["devices"][device_id] = {
+                "status": "complete",
+                "row_count": len(rows),
+            }
     manifest = {
         "status": "complete",
         "algorithm_version": 1,
@@ -205,9 +217,90 @@ def test_manifest_label_hash_and_table_validation_reject_changes(tmp_path):
     frame.loc[0, ["dst_unicast", "dst_multicast"]] = [1, 1]
     pq.write_table(pa.Table.from_pandas(frame, schema=packet_schema()), path)
     with pytest.raises(pipeline.PipelineError, match="destination type"):
-        pipeline.load_packet_datasets(
-            ["NCSU"], features, labels, "fixture_labels.json"
+        pipeline.load_packet_catalog(
+            ["NCSU"],
+            features,
+            labels,
+            "fixture_labels.json",
+            scan_batch_rows=3,
         )
+
+
+def test_streamed_catalog_scaler_and_cache_avoid_full_table_loading(
+    tmp_path, monkeypatch
+):
+    features = tmp_path / "features"
+    labels = tmp_path / "labels"
+    write_packet_fixture(features, labels, ["NCSU"], 2)
+
+    def reject_read_table(*_args, **_kwargs):
+        raise AssertionError("out-of-core path must not use pq.read_table")
+
+    monkeypatch.setattr(pipeline.pq, "read_table", reject_read_table)
+    catalog = pipeline.load_packet_catalog(
+        ["NCSU"],
+        features,
+        labels,
+        "fixture_labels.json",
+        scan_batch_rows=3,
+    )
+    assert catalog.total_rows == 32
+    assert len(catalog.captures) == 8
+
+    expected_rows = []
+    label_values = label_map(2)
+    for device_id, metadata in label_values.items():
+        expected_rows.extend(
+            packet_rows("NCSU", device_id, metadata["is_iot_device"])
+        )
+    expected_features = np.asarray(
+        [
+            [row[column] for column in pipeline.MODEL_FEATURE_COLUMNS]
+            for row in expected_rows
+        ],
+        dtype=np.float64,
+    )
+    expected_scaler = pipeline.StandardScaler().fit(
+        np.log1p(expected_features[:, pipeline.CONTINUOUS_FEATURE_INDEXES])
+    )
+    scaler = pipeline.fit_packet_scaler(catalog.captures)
+    assert np.allclose(scaler.mean_, expected_scaler.mean_)
+    assert np.allclose(scaler.var_, expected_scaler.var_)
+
+    candidates, _counts = pipeline.build_sequence_candidates(
+        catalog.captures, 4, 2, 42, "cache-test"
+    )
+    cache_dir = tmp_path / "cache" / "phase"
+    config = pipeline.TrainingConfig(sequence_packets=4)
+    with pipeline.sequence_cache(
+        catalog.captures, candidates, scaler, config, cache_dir
+    ) as dataset:
+        values, label, length = dataset[0]
+        candidate = candidates[0]
+        capture = catalog.captures[candidate.stream_index]
+        raw = pipeline.ParquetWindowReader().read(
+            capture, candidate.start, candidate.valid_length
+        )
+        expected = raw.astype(np.float32, copy=True)
+        expected[:, pipeline.CONTINUOUS_FEATURE_INDEXES] = scaler.transform(
+            np.log1p(raw[:, pipeline.CONTINUOUS_FEATURE_INDEXES])
+        ).astype(np.float32)
+        assert values.shape == (4, 7)
+        assert label in (0, 1)
+        assert length == 4
+        assert np.isfinite(values).all()
+        assert np.allclose(values, expected)
+    assert not cache_dir.exists()
+
+
+def test_sequence_cache_rejects_insufficient_disk(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        pipeline.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(total=100, used=100, free=0),
+    )
+    with pytest.raises(pipeline.PipelineError, match="insufficient sequence-cache"):
+        pipeline._check_cache_space(tmp_path / "cache", 1)
 
 
 def test_sliding_candidates_cap_boundaries_and_short_padding():
@@ -347,6 +440,8 @@ def arguments(tmp_path, class_count: int):
         dropout=0.1,
         max_sequences_per_device=10,
         loader_workers=0,
+        scan_batch_rows=3,
+        cache_root=tmp_path / "cache",
         device="cpu",
         test_trials=3,
         seed=42,
@@ -380,6 +475,7 @@ def test_end_to_end_binary_and_multiclass_artifacts(tmp_path, class_count):
     )
     aggregate = json.loads((output / "aggregate_metrics.json").read_text())
     assert set(aggregate["by_dataset_across_model_run_means"]) == {"UNSW1"}
+    assert not any(args.cache_root.iterdir())
 
 
 def test_resume_invalidation_overwrite_safety_and_preexisting_stop(tmp_path):
@@ -408,3 +504,14 @@ def test_resume_invalidation_overwrite_safety_and_preexisting_stop(tmp_path):
     result = pipeline.execute_experiment(stopped_args)
     assert result == output
     assert marker.read_text() == "keep"
+
+
+def test_two_cpu_model_workers_use_isolated_caches(tmp_path):
+    args = arguments(tmp_path, 2)
+    args.removal_runs = 2
+    args.jobs = 2
+    output = pipeline.execute_experiment(args)
+
+    assert (output / "model_run_001" / "lstm_state.pt").is_file()
+    assert (output / "model_run_002" / "lstm_state.pt").is_file()
+    assert not any(args.cache_root.iterdir())

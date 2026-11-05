@@ -178,7 +178,7 @@ def test_matrix_cli_requires_one_model_and_uses_v2_defaults():
 def test_model_specific_scheduling_policy():
     assert runner.scheduling_policy(["cnn-pn-rf"], None, 3) == (
         "cnn-pn-rf",
-        1,
+        runner.CNN_MAX_CONCURRENT_EXPERIMENTS,
         1,
     )
     assert runner.scheduling_policy(["decision-tree"], None, 3) == (
@@ -192,14 +192,23 @@ def test_model_specific_scheduling_policy():
         2,
     )
     assert runner.scheduling_policy(["blstm"], None, 3) == ("blstm", 1, 1)
-    assert runner.scheduling_policy(["blstm"], None, 3, 4) == ("blstm", 1, 4)
+    assert runner.scheduling_policy(["blstm"], None, 3, 4, "cpu") == (
+        "blstm",
+        1,
+        4,
+    )
+    assert runner.scheduling_policy(["blstm"], 2, 3, 4, "cpu") == (
+        "blstm",
+        2,
+        4,
+    )
 
 
 @pytest.mark.parametrize(
     ("models", "concurrency"),
     [
         (["cnn-pn-rf", "decision-tree"], None),
-        (["cnn-pn-rf"], 2),
+        (["cnn-pn-rf"], runner.CNN_MAX_CONCURRENT_EXPERIMENTS + 1),
         (["blstm"], 2),
         (["decision-tree"], 5),
     ],
@@ -235,7 +244,10 @@ def test_blstm_command_uses_packet_features_and_sequence_output(tmp_path):
         "blstm", "multiclass", 40, ("NCSU",), "UNSW1"
     )
     config = replace(
-        settings(tmp_path, model="blstm"), blstm_device="cpu", blstm_jobs=4
+        settings(tmp_path, model="blstm"),
+        blstm_device="cpu",
+        blstm_jobs=4,
+        blstm_cache_root=tmp_path / "scratch",
     )
     command = runner.build_command(current, config)
 
@@ -250,6 +262,7 @@ def test_blstm_command_uses_packet_features_and_sequence_output(tmp_path):
     assert option_value(command, "--max-sequences-per-device") == "5000"
     assert option_value(command, "--device") == "cpu"
     assert option_value(command, "--jobs") == "4"
+    assert option_value(command, "--cache-root") == str(tmp_path / "scratch")
 
 
 def test_cpu_cnn_runner_adds_bounded_rf_workers(tmp_path):

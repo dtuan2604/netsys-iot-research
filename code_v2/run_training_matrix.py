@@ -122,6 +122,7 @@ class RunnerSettings:
     blstm_device: str = BLSTM_DEVICE
     blstm_max_sequences_per_device: int = BLSTM_MAX_SEQUENCES_PER_DEVICE
     blstm_jobs: int = 1
+    blstm_cache_root: Path | None = None
 
 
 def utc_now() -> str:
@@ -225,6 +226,7 @@ def scheduling_policy(
     requested_concurrency: int | None,
     decision_tree_jobs: int,
     blstm_jobs: int = 1,
+    blstm_device: str = BLSTM_DEVICE,
 ) -> tuple[str, int, int]:
     selected = list(dict.fromkeys(models))
     if len(selected) != 1:
@@ -237,9 +239,13 @@ def scheduling_policy(
         maximum = CNN_MAX_CONCURRENT_EXPERIMENTS
         workers = 1
     elif model == "blstm":
-        maximum = BLSTM_MAX_CONCURRENT_EXPERIMENTS
+        maximum = BLSTM_MAX_CONCURRENT_EXPERIMENTS if blstm_device == "cpu" else 1
         if blstm_jobs <= 0:
             raise MatrixError("--blstm-jobs must be a positive integer")
+        if blstm_jobs > 1 and blstm_device != "cpu":
+            raise MatrixError(
+                "--blstm-jobs greater than 1 requires --blstm-device cpu"
+            )
         workers = blstm_jobs
     elif model == "decision-tree":
         maximum = DECISION_TREE_MAX_CONCURRENT_EXPERIMENTS
@@ -248,7 +254,11 @@ def scheduling_policy(
         workers = decision_tree_jobs
     else:
         raise MatrixError(f"unknown model: {model}")
-    concurrency = maximum if requested_concurrency is None else requested_concurrency
+    concurrency = (
+        1
+        if requested_concurrency is None and model == "blstm"
+        else maximum if requested_concurrency is None else requested_concurrency
+    )
     if concurrency <= 0 or concurrency > maximum:
         raise MatrixError(
             f"--max-concurrent-experiments for {model} must be between 1 and {maximum}"
@@ -348,6 +358,8 @@ def build_command(
                     "16",
                 ]
             )
+        if settings.blstm_cache_root is not None:
+            command.extend(["--cache-root", str(settings.blstm_cache_root)])
     else:
         command.extend(["--jobs", str(settings.workers_per_experiment)])
     if settings.stop_file is not None:
@@ -454,6 +466,11 @@ def matrix_configuration(
                     settings.blstm_max_sequences_per_device
                 ),
                 "blstm_jobs": settings.blstm_jobs,
+                "blstm_cache_root": (
+                    str(settings.blstm_cache_root)
+                    if settings.blstm_cache_root is not None
+                    else None
+                ),
             }
         )
     return configuration
@@ -472,6 +489,7 @@ def fingerprint_configuration(configuration: dict[str, Any]) -> dict[str, Any]:
         "decision_tree_jobs",
         "workers_per_experiment",
         "blstm_jobs",
+        "blstm_cache_root",
     }
     return {
         key: value for key, value in configuration.items() if key not in scheduling_keys
@@ -794,6 +812,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--blstm-cache-root",
+        type=Path,
+        help="temporary disk-backed BLSTM sequence cache root",
+    )
+    parser.add_argument(
         "--cnn-rf-jobs",
         type=int,
         default=-1,
@@ -803,8 +826,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--max-concurrent-experiments",
         type=int,
         help=(
-            "simultaneous trainer processes; defaults to 1 for CNN-PN-RF/BLSTM "
-            "and 4 for decision tree"
+            "simultaneous trainer processes; BLSTM defaults to 1 and permits up "
+            "to 4 only with --blstm-device cpu"
         ),
     )
     parser.add_argument(
@@ -858,6 +881,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.max_concurrent_experiments,
             args.decision_tree_jobs,
             args.blstm_jobs,
+            args.blstm_device,
         )
         stop_file = resolve_from_repo(args.stop_file) if args.stop_file else None
         settings = RunnerSettings(
@@ -879,6 +903,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 20 if args.smoke else args.blstm_max_sequences_per_device
             ),
             blstm_jobs=args.blstm_jobs,
+            blstm_cache_root=(
+                resolve_from_repo(args.blstm_cache_root)
+                if args.blstm_cache_root is not None
+                else None
+            ),
             max_concurrent_experiments=concurrency,
             workers_per_experiment=workers_per_experiment,
             smoke=args.smoke,

@@ -11,11 +11,14 @@ import math
 import os
 import platform
 import random
+import resource
 import shutil
 import sys
+from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 import joblib
 import numpy as np
@@ -37,6 +40,8 @@ except ImportError:  # pragma: no cover - direct script execution
 
 
 PACKET_ALGORITHM_VERSION = 1
+DATA_ACCESS_VERSION = 2
+DEFAULT_SCAN_BATCH_ROWS = 100_000
 MODEL_FEATURE_COLUMNS = (
     "frame_size",
     "direction",
@@ -102,6 +107,34 @@ class LoadedPackets:
     streams: list[PacketStream]
     device_frame: pd.DataFrame
     unevaluable_devices: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class ContinuousStats:
+    count: int
+    mean: tuple[float, float, float]
+    m2: tuple[float, float, float]
+
+
+@dataclass(frozen=True)
+class PacketCapture:
+    dataset: str
+    device_id: str
+    capture_id: str
+    label: int
+    path: str
+    row_offset: int
+    packet_count: int
+    continuous_stats: ContinuousStats
+
+
+@dataclass
+class LoadedPacketCatalog:
+    captures: list[PacketCapture]
+    device_frame: pd.DataFrame
+    unevaluable_devices: list[dict[str, Any]]
+    total_rows: int
+    source_bytes: int
 
 
 @dataclass(frozen=True)
@@ -374,6 +407,319 @@ def load_packet_datasets(
     )
 
 
+def _validate_packet_schema(schema: pa.Schema, path: Path) -> None:
+    missing = set(PACKET_COLUMNS) - set(schema.names)
+    if missing:
+        raise PipelineError(f"{path}: missing columns {', '.join(sorted(missing))}")
+    for column in ("dataset", "capture_id", "device_id", "device_id_type"):
+        if not pa.types.is_string(schema.field(column).type):
+            raise PipelineError(f"{path}: {column} must have string type")
+    for column in ("is_iot_device", "packet_index", "timestamp_ns"):
+        if not pa.types.is_integer(schema.field(column).type):
+            raise PipelineError(f"{path}: {column} must have integer type")
+    for column in MODEL_FEATURE_COLUMNS:
+        column_type = schema.field(column).type
+        if not (pa.types.is_integer(column_type) or pa.types.is_floating(column_type)):
+            raise PipelineError(f"{path}: model feature {column} must be numeric")
+    for column in AUXILIARY_FEATURE_COLUMNS:
+        if not pa.types.is_boolean(schema.field(column).type):
+            raise PipelineError(f"{path}: {column} must be boolean")
+
+
+def _merge_continuous_stats(
+    left: ContinuousStats | None, right: ContinuousStats
+) -> ContinuousStats:
+    if left is None or left.count == 0:
+        return right
+    if right.count == 0:
+        return left
+    left_mean = np.asarray(left.mean, dtype=np.float64)
+    right_mean = np.asarray(right.mean, dtype=np.float64)
+    left_m2 = np.asarray(left.m2, dtype=np.float64)
+    right_m2 = np.asarray(right.m2, dtype=np.float64)
+    total = left.count + right.count
+    delta = right_mean - left_mean
+    mean = left_mean + delta * (right.count / total)
+    m2 = left_m2 + right_m2 + delta * delta * (left.count * right.count / total)
+    return ContinuousStats(
+        total,
+        tuple(float(value) for value in mean),
+        tuple(float(value) for value in m2),
+    )
+
+
+def _continuous_stats(values: np.ndarray) -> ContinuousStats:
+    if not len(values):
+        return ContinuousStats(0, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
+    mean = values.mean(axis=0, dtype=np.float64)
+    centered = values - mean
+    m2 = np.sum(centered * centered, axis=0, dtype=np.float64)
+    return ContinuousStats(
+        len(values),
+        tuple(float(value) for value in mean),
+        tuple(float(value) for value in m2),
+    )
+
+
+def _batch_column(batch: pa.RecordBatch, name: str) -> pa.Array:
+    return batch.column(batch.schema.get_field_index(name))
+
+
+def _all_equal(array: pa.Array, value: Any) -> bool:
+    result = pc.all(pc.equal(array, pa.scalar(value, type=array.type)))
+    return bool(result.as_py())
+
+
+def _validate_capture_slice(
+    batch: pa.RecordBatch,
+    *,
+    dataset: str,
+    device_id: str,
+    capture_id: str,
+    label: int,
+    capture_position: int,
+    last_timestamp: int | None,
+    seen_directions: set[int],
+    path: Path,
+) -> tuple[int | None, set[int], ContinuousStats]:
+    for column, expected in (
+        ("dataset", dataset),
+        ("capture_id", capture_id),
+        ("device_id", device_id),
+        ("device_id_type", "mac"),
+        ("is_iot_device", label),
+    ):
+        values = _batch_column(batch, column)
+        if values.null_count or not _all_equal(values, expected):
+            raise PipelineError(
+                f"{path}: {column} does not match {expected!r} in {capture_id}"
+            )
+
+    indexes = _batch_column(batch, "packet_index").to_numpy(zero_copy_only=False)
+    expected_indexes = np.arange(
+        capture_position, capture_position + batch.num_rows, dtype=np.int64
+    )
+    if not np.array_equal(indexes.astype(np.int64, copy=False), expected_indexes):
+        raise PipelineError(
+            f"{path}: {capture_id} packet_index must be contiguous from zero"
+        )
+    timestamps = _batch_column(batch, "timestamp_ns").to_numpy(zero_copy_only=False)
+    timestamps = timestamps.astype(np.int64, copy=False)
+    if len(timestamps):
+        if last_timestamp is not None and timestamps[0] < last_timestamp:
+            raise PipelineError(f"{path}: {capture_id} timestamps are out of order")
+        if len(timestamps) > 1 and np.any(np.diff(timestamps) < 0):
+            raise PipelineError(f"{path}: {capture_id} timestamps are out of order")
+        last_timestamp = int(timestamps[-1])
+
+    feature_columns = []
+    for column in MODEL_FEATURE_COLUMNS:
+        values = _batch_column(batch, column)
+        if values.null_count:
+            raise PipelineError(f"{path}: model feature {column} contains nulls")
+        feature_columns.append(values.to_numpy(zero_copy_only=False))
+    features = np.column_stack(feature_columns).astype(np.float64, copy=False)
+    if not np.isfinite(features).all():
+        raise PipelineError(f"{path}: model features are not finite")
+    if np.any(features < 0):
+        raise PipelineError(f"{path}: model features are negative")
+    if np.any(features[:, 0] <= 0):
+        raise PipelineError(f"{path}: frame_size must be positive")
+
+    directions = features[:, 1].astype(np.int64, copy=False)
+    if not np.isin(directions, [0, 1]).all():
+        raise PipelineError(f"{path}: direction must contain only zero or one")
+    destinations = features[:, 3:6].astype(np.int64, copy=False)
+    if not np.isin(destinations, [0, 1]).all() or not np.all(
+        destinations.sum(axis=1) == 1
+    ):
+        raise PipelineError(f"{path}: destination type must be one-hot")
+
+    ordinary_valid = _batch_column(
+        batch, "inter_arrival_valid"
+    ).to_numpy(zero_copy_only=False).astype(bool, copy=False)
+    expected_ordinary = expected_indexes > 0
+    if not np.array_equal(ordinary_valid, expected_ordinary):
+        raise PipelineError(f"{path}: invalid inter-arrival validity flags")
+    same_valid = _batch_column(
+        batch, "same_direction_iat_valid"
+    ).to_numpy(zero_copy_only=False).astype(bool, copy=False)
+    expected_same = np.empty(len(directions), dtype=bool)
+    updated_seen = set(seen_directions)
+    for index, direction in enumerate(directions.tolist()):
+        expected_same[index] = direction in updated_seen
+        updated_seen.add(direction)
+    if not np.array_equal(same_valid, expected_same):
+        raise PipelineError(f"{path}: invalid same-direction validity flags")
+    if np.any(features[~ordinary_valid, 2] != 0) or np.any(
+        features[~same_valid, 6] != 0
+    ):
+        raise PipelineError(f"{path}: invalid intervals must be encoded as zero")
+    stats = _continuous_stats(
+        np.log1p(features[:, CONTINUOUS_FEATURE_INDEXES])
+    )
+    return last_timestamp, updated_seen, stats
+
+
+def load_packet_catalog(
+    datasets: Sequence[str],
+    features_root: Path,
+    labels_root: Path,
+    label_file: str,
+    *,
+    scan_batch_rows: int = DEFAULT_SCAN_BATCH_ROWS,
+    stop_file: Path | str | None = None,
+) -> LoadedPacketCatalog:
+    """Stream-validate packet features and retain only capture metadata/statistics."""
+    if scan_batch_rows <= 0:
+        raise PipelineError("scan batch rows must be positive")
+    validate_packet_feature_manifest(features_root, labels_root, label_file, datasets)
+    manifest = common.read_json(features_root / "_run_manifest.json")
+    inventory = manifest["datasets"]
+    captures: list[PacketCapture] = []
+    unevaluable: list[dict[str, Any]] = []
+    device_rows: list[dict[str, Any]] = []
+    total_rows = 0
+    source_bytes = 0
+    for dataset in datasets:
+        common.check_stop(stop_file)
+        labels = common.load_mac_label_map(labels_root, dataset, label_file)
+        dataset_entry = inventory.get(dataset, {})
+        dates = dataset_entry.get("dates")
+        devices = dataset_entry.get("devices")
+        if not isinstance(dates, dict) or not isinstance(devices, dict):
+            raise PipelineError(
+                f"{dataset}: packet manifest lacks date/device row inventory"
+            )
+        capture_ids = sorted(dates)
+        if not capture_ids:
+            raise PipelineError(f"{dataset}: packet manifest has no capture dates")
+        folder = features_root / dataset
+        unexpected = {
+            path.name
+            for path in folder.iterdir()
+            if path.is_dir() and not path.name.startswith(".")
+        } - set(labels)
+        if unexpected:
+            raise PipelineError(
+                f"{dataset}: packet-feature folders absent from labels: "
+                f"{sorted(unexpected)}"
+            )
+        for device_id, label in labels.items():
+            common.check_stop(stop_file)
+            path = folder / device_id / "features.parquet"
+            if not path.is_file():
+                raise PipelineError(f"missing packet-feature file: {path}")
+            parquet = pq.ParquetFile(path)
+            _validate_packet_schema(parquet.schema_arrow, path)
+            counts = []
+            for capture_id in capture_ids:
+                date_entry = dates[capture_id]
+                row_counts = date_entry.get("row_counts") if isinstance(date_entry, dict) else None
+                if not isinstance(row_counts, dict) or device_id not in row_counts:
+                    raise PipelineError(
+                        f"{dataset}/{capture_id}: missing row count for {device_id}"
+                    )
+                count = row_counts[device_id]
+                if not isinstance(count, int) or count < 0:
+                    raise PipelineError(
+                        f"{dataset}/{capture_id}/{device_id}: invalid row count"
+                    )
+                counts.append(count)
+            expected_rows = sum(counts)
+            if parquet.metadata.num_rows != expected_rows:
+                raise PipelineError(
+                    f"{path}: row count {parquet.metadata.num_rows} != {expected_rows}"
+                )
+            device_record = devices.get(device_id)
+            if not isinstance(device_record, dict) or device_record.get("row_count") != expected_rows:
+                raise PipelineError(f"{dataset}/{device_id}: manifest device row count mismatch")
+            source_bytes += path.stat().st_size
+            if expected_rows == 0:
+                unevaluable.append(
+                    {
+                        "dataset": dataset,
+                        "device_id": device_id,
+                        "true_label": int(label),
+                        "reason": "no packet rows",
+                    }
+                )
+                continue
+            device_rows.append(
+                {"dataset": dataset, "device_id": device_id, "label": int(label)}
+            )
+            offsets = np.cumsum([0, *counts], dtype=np.int64)
+            stats_by_capture: list[ContinuousStats | None] = [None] * len(capture_ids)
+            last_timestamps: list[int | None] = [None] * len(capture_ids)
+            seen_directions: list[set[int]] = [set() for _ in capture_ids]
+            global_position = 0
+            for batch in parquet.iter_batches(
+                batch_size=scan_batch_rows, columns=list(PACKET_COLUMNS)
+            ):
+                common.check_stop(stop_file)
+                local_position = 0
+                while local_position < batch.num_rows:
+                    capture_index = bisect.bisect_right(
+                        offsets.tolist(), global_position
+                    ) - 1
+                    if capture_index >= len(capture_ids):
+                        raise PipelineError(f"{path}: rows exceed manifest boundaries")
+                    capture_end = int(offsets[capture_index + 1])
+                    take = min(batch.num_rows - local_position, capture_end - global_position)
+                    piece = batch.slice(local_position, take)
+                    capture_position = global_position - int(offsets[capture_index])
+                    last_timestamp, seen, piece_stats = _validate_capture_slice(
+                        piece,
+                        dataset=dataset,
+                        device_id=device_id,
+                        capture_id=capture_ids[capture_index],
+                        label=int(label),
+                        capture_position=capture_position,
+                        last_timestamp=last_timestamps[capture_index],
+                        seen_directions=seen_directions[capture_index],
+                        path=path,
+                    )
+                    last_timestamps[capture_index] = last_timestamp
+                    seen_directions[capture_index] = seen
+                    stats_by_capture[capture_index] = _merge_continuous_stats(
+                        stats_by_capture[capture_index], piece_stats
+                    )
+                    local_position += take
+                    global_position += take
+            if global_position != expected_rows:
+                raise PipelineError(f"{path}: streamed row count mismatch")
+            for index, (capture_id, count) in enumerate(zip(capture_ids, counts)):
+                if not count:
+                    continue
+                stats = stats_by_capture[index]
+                if stats is None or stats.count != count:
+                    raise PipelineError(
+                        f"{path}: incomplete statistics for {capture_id}"
+                    )
+                captures.append(
+                    PacketCapture(
+                        dataset=dataset,
+                        device_id=device_id,
+                        capture_id=capture_id,
+                        label=int(label),
+                        path=str(path),
+                        row_offset=int(offsets[index]),
+                        packet_count=count,
+                        continuous_stats=stats,
+                    )
+                )
+            total_rows += expected_rows
+    if not captures:
+        raise PipelineError("selected datasets contain no packet rows")
+    return LoadedPacketCatalog(
+        captures=captures,
+        device_frame=pd.DataFrame(device_rows).drop_duplicates(ignore_index=True),
+        unevaluable_devices=unevaluable,
+        total_rows=total_rows,
+        source_bytes=source_bytes,
+    )
+
+
 def split_training_streams(
     streams: Sequence[PacketStream], validation_fraction: float, seed: int
 ) -> tuple[list[PacketStream], list[PacketStream], list[dict[str, Any]]]:
@@ -469,8 +815,18 @@ def _stable_seed(seed: int, *parts: str) -> np.random.SeedSequence:
     return np.random.SeedSequence([seed, int.from_bytes(digest[:8], "big")])
 
 
-def stream_candidate_count(stream: PacketStream, sequence_packets: int) -> int:
-    size = len(stream.features)
+def _stream_packet_count(stream: PacketStream | PacketCapture) -> int:
+    return (
+        int(stream.packet_count)
+        if isinstance(stream, PacketCapture)
+        else len(stream.features)
+    )
+
+
+def stream_candidate_count(
+    stream: PacketStream | PacketCapture, sequence_packets: int
+) -> int:
+    size = _stream_packet_count(stream)
     if size <= 0:
         return 0
     return 1 if size < sequence_packets else size - sequence_packets + 1
@@ -488,11 +844,12 @@ def _ordinal_candidate(
     previous = 0 if position == 0 else cumulative[position - 1]
     stream_index = int(stream_indexes[position])
     stream = streams[stream_index]
-    start = int(ordinal - previous) if len(stream.features) >= sequence_packets else 0
+    size = _stream_packet_count(stream)
+    start = int(ordinal - previous) if size >= sequence_packets else 0
     return SequenceCandidate(
         stream_index=stream_index,
         start=start,
-        valid_length=min(sequence_packets, len(stream.features) - start),
+        valid_length=min(sequence_packets, size - start),
     )
 
 
@@ -533,9 +890,36 @@ def build_sequence_candidates(
     return candidates, counts
 
 
-def fit_packet_scaler(streams: Sequence[PacketStream]) -> StandardScaler:
+def _scaler_from_stats(stats: ContinuousStats) -> StandardScaler:
+    if stats.count <= 0:
+        raise PipelineError("cannot fit packet scaler without packets")
+    mean = np.asarray(stats.mean, dtype=np.float64)
+    variance = np.maximum(np.asarray(stats.m2, dtype=np.float64) / stats.count, 0)
+    scale = np.sqrt(variance)
+    scale[scale == 0] = 1.0
+    scaler = StandardScaler()
+    scaler.mean_ = mean
+    scaler.var_ = variance
+    scaler.scale_ = scale
+    scaler.n_features_in_ = len(CONTINUOUS_FEATURE_INDEXES)
+    scaler.n_samples_seen_ = np.int64(stats.count)
+    return scaler
+
+
+def fit_packet_scaler(
+    streams: Sequence[PacketStream | PacketCapture],
+) -> StandardScaler:
+    if streams and isinstance(streams[0], PacketCapture):
+        merged: ContinuousStats | None = None
+        for stream in streams:
+            assert isinstance(stream, PacketCapture)
+            merged = _merge_continuous_stats(merged, stream.continuous_stats)
+        if merged is None:
+            raise PipelineError("cannot fit packet scaler without packets")
+        return _scaler_from_stats(merged)
     scaler = StandardScaler()
     for stream in streams:
+        assert isinstance(stream, PacketStream)
         values = np.log1p(stream.features[:, CONTINUOUS_FEATURE_INDEXES])
         scaler.partial_fit(values)
     return scaler
@@ -590,6 +974,186 @@ class PacketSequenceDataset(Dataset):
         end = candidate.start + candidate.valid_length
         values[: candidate.valid_length] = stream.features[candidate.start:end]
         return values, np.int64(stream.label), np.int64(candidate.valid_length)
+
+
+class CachedSequenceDataset(Dataset):
+    def __init__(
+        self,
+        path: Path,
+        labels: np.ndarray,
+        lengths: np.ndarray,
+    ) -> None:
+        self.path = str(path)
+        self.labels = labels.astype(np.int64, copy=False)
+        self.lengths = lengths.astype(np.int64, copy=False)
+        self._values: np.memmap | None = None
+
+    def __len__(self) -> int:
+        return len(self.labels)
+
+    def _array(self) -> np.memmap:
+        if self._values is None:
+            self._values = np.load(self.path, mmap_mode="r")
+        return self._values
+
+    def __getitem__(self, index: int):
+        values = np.array(self._array()[index], dtype=np.float32, copy=True)
+        return values, self.labels[index], self.lengths[index]
+
+    def close(self) -> None:
+        if self._values is not None:
+            mmap = getattr(self._values, "_mmap", None)
+            if mmap is not None:
+                mmap.close()
+            self._values = None
+
+    def __getstate__(self):
+        state = dict(self.__dict__)
+        state["_values"] = None
+        return state
+
+
+class ParquetWindowReader:
+    def __init__(self, maximum_cached_row_groups: int = 4) -> None:
+        self.maximum_cached_row_groups = maximum_cached_row_groups
+        self.files: dict[str, tuple[pq.ParquetFile, list[int]]] = {}
+        self.cache: OrderedDict[tuple[str, int], np.ndarray] = OrderedDict()
+
+    def _file(self, path: str) -> tuple[pq.ParquetFile, list[int]]:
+        loaded = self.files.get(path)
+        if loaded is not None:
+            return loaded
+        parquet = pq.ParquetFile(path)
+        offsets = [0]
+        for index in range(parquet.metadata.num_row_groups):
+            offsets.append(
+                offsets[-1] + parquet.metadata.row_group(index).num_rows
+            )
+        loaded = (parquet, offsets)
+        self.files[path] = loaded
+        return loaded
+
+    def _row_group(self, path: str, index: int) -> np.ndarray:
+        key = (path, index)
+        values = self.cache.pop(key, None)
+        if values is not None:
+            self.cache[key] = values
+            return values
+        parquet, _offsets = self._file(path)
+        table = parquet.read_row_group(index, columns=list(MODEL_FEATURE_COLUMNS))
+        values = np.column_stack(
+            [
+                table.column(column).to_numpy(zero_copy_only=False)
+                for column in MODEL_FEATURE_COLUMNS
+            ]
+        ).astype(np.float32, copy=False)
+        self.cache[key] = values
+        while len(self.cache) > self.maximum_cached_row_groups:
+            self.cache.popitem(last=False)
+        return values
+
+    def read(self, capture: PacketCapture, start: int, length: int) -> np.ndarray:
+        absolute = capture.row_offset + start
+        remaining = length
+        pieces = []
+        _parquet, offsets = self._file(capture.path)
+        while remaining:
+            row_group = bisect.bisect_right(offsets, absolute) - 1
+            if row_group < 0 or row_group >= len(offsets) - 1:
+                raise PipelineError(
+                    f"sequence range exceeds packet source: {capture.path}"
+                )
+            local = absolute - offsets[row_group]
+            take = min(remaining, offsets[row_group + 1] - absolute)
+            pieces.append(self._row_group(capture.path, row_group)[local : local + take])
+            absolute += take
+            remaining -= take
+        return pieces[0].copy() if len(pieces) == 1 else np.concatenate(pieces)
+
+
+def sequence_cache_bytes(candidate_count: int, sequence_packets: int) -> int:
+    return candidate_count * sequence_packets * len(MODEL_FEATURE_COLUMNS) * 4
+
+
+def _check_cache_space(root: Path, required_bytes: int) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    free = shutil.disk_usage(root).free
+    margin = max(64 * 1024 * 1024, required_bytes // 10)
+    if free < required_bytes + margin:
+        raise PipelineError(
+            "insufficient sequence-cache space: "
+            f"required={required_bytes + margin:,} bytes including margin, "
+            f"free={free:,} bytes, root={root}"
+        )
+
+
+def materialize_sequence_cache(
+    streams: Sequence[PacketCapture],
+    candidates: Sequence[SequenceCandidate],
+    scaler: StandardScaler,
+    sequence_packets: int,
+    directory: Path,
+) -> CachedSequenceDataset:
+    if not candidates:
+        raise PipelineError("cannot materialize an empty sequence cache")
+    required = sequence_cache_bytes(len(candidates), sequence_packets)
+    _check_cache_space(directory.parent, required)
+    if directory.exists():
+        shutil.rmtree(directory)
+    directory.mkdir(parents=True)
+    path = directory / "features.npy"
+    values = np.lib.format.open_memmap(
+        path,
+        mode="w+",
+        dtype=np.float32,
+        shape=(len(candidates), sequence_packets, len(MODEL_FEATURE_COLUMNS)),
+    )
+    labels = np.empty(len(candidates), dtype=np.int64)
+    lengths = np.empty(len(candidates), dtype=np.int64)
+    reader = ParquetWindowReader()
+    try:
+        for index, candidate in enumerate(candidates):
+            capture = streams[candidate.stream_index]
+            raw = reader.read(capture, candidate.start, candidate.valid_length)
+            values[index] = 0
+            values[index, : candidate.valid_length] = raw
+            continuous = np.log1p(
+                raw[:, CONTINUOUS_FEATURE_INDEXES].astype(np.float64, copy=False)
+            )
+            scaled = ((continuous - scaler.mean_) / scaler.scale_).astype(np.float32)
+            for position, column in enumerate(CONTINUOUS_FEATURE_INDEXES):
+                values[index, : candidate.valid_length, column] = scaled[:, position]
+            labels[index] = capture.label
+            lengths[index] = candidate.valid_length
+        values.flush()
+    except BaseException:
+        mmap = getattr(values, "_mmap", None)
+        if mmap is not None:
+            mmap.close()
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+    mmap = getattr(values, "_mmap", None)
+    if mmap is not None:
+        mmap.close()
+    return CachedSequenceDataset(path, labels, lengths)
+
+
+@contextmanager
+def sequence_cache(
+    streams: Sequence[PacketCapture],
+    candidates: Sequence[SequenceCandidate],
+    scaler: StandardScaler,
+    config: TrainingConfig,
+    directory: Path,
+) -> Iterator[CachedSequenceDataset]:
+    dataset = materialize_sequence_cache(
+        streams, candidates, scaler, config.sequence_packets, directory
+    )
+    try:
+        yield dataset
+    finally:
+        dataset.close()
+        shutil.rmtree(directory, ignore_errors=True)
 
 
 class PacketSequenceClassifier(nn.Module):
@@ -686,6 +1250,11 @@ def torch_device_description(device: torch.device) -> str:
     return platform.processor() or platform.machine() or "CPU"
 
 
+def peak_rss_bytes() -> int:
+    value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    return value if sys.platform == "darwin" else value * 1024
+
+
 def _loader(
     streams: Sequence[PacketStream],
     candidates: Sequence[SequenceCandidate],
@@ -698,6 +1267,25 @@ def _loader(
     generator.manual_seed(seed)
     return DataLoader(
         PacketSequenceDataset(streams, candidates, config.sequence_packets),
+        batch_size=config.batch_size,
+        shuffle=shuffle,
+        num_workers=config.loader_workers,
+        persistent_workers=config.loader_workers > 0,
+        generator=generator,
+    )
+
+
+def _dataset_loader(
+    dataset: Dataset,
+    config: TrainingConfig,
+    *,
+    shuffle: bool,
+    seed: int,
+) -> DataLoader:
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return DataLoader(
+        dataset,
         batch_size=config.batch_size,
         shuffle=shuffle,
         num_workers=config.loader_workers,
@@ -883,6 +1471,97 @@ def train_final_model(
     return model, weights.tolist(), history
 
 
+def select_best_epoch_cached(
+    fit_dataset: Dataset,
+    validation_dataset: Dataset,
+    weights: np.ndarray,
+    classes: Sequence[int],
+    config: TrainingConfig,
+    device: torch.device,
+    stop_file: Path | str | None,
+) -> tuple[int, list[dict[str, Any]]]:
+    set_reproducible_seed(config.seed)
+    model = PacketSequenceClassifier(
+        len(classes), config.hidden_size, config.dropout, config.model_type
+    ).to(device)
+    criterion = nn.CrossEntropyLoss(weight=torch.from_numpy(weights).to(device))
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
+    )
+    fit_loader = _dataset_loader(
+        fit_dataset, config, shuffle=True, seed=config.seed
+    )
+    validation_loader = _dataset_loader(
+        validation_dataset, config, shuffle=False, seed=config.seed
+    )
+    best_loss = math.inf
+    best_epoch = 1
+    without_improvement = 0
+    history = []
+    for epoch in range(1, config.max_epochs + 1):
+        train_loss, train_accuracy = _training_epoch(
+            model, fit_loader, criterion, optimizer, device, stop_file
+        )
+        validation_loss, validation_accuracy = _evaluation_epoch(
+            model, validation_loader, criterion, device, stop_file
+        )
+        history.append(
+            {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "train_accuracy": train_accuracy,
+                "validation_loss": validation_loss,
+                "validation_accuracy": validation_accuracy,
+            }
+        )
+        print(
+            f"epoch {epoch:03d}: train_loss={train_loss:.6f} "
+            f"val_loss={validation_loss:.6f} val_accuracy={validation_accuracy:.4f}",
+            flush=True,
+        )
+        if validation_loss < best_loss - 1e-8:
+            best_loss = validation_loss
+            best_epoch = epoch
+            without_improvement = 0
+        else:
+            without_improvement += 1
+            if without_improvement >= config.patience:
+                break
+    return best_epoch, history
+
+
+def train_final_model_cached(
+    dataset: Dataset,
+    weights: np.ndarray,
+    classes: Sequence[int],
+    epochs: int,
+    config: TrainingConfig,
+    device: torch.device,
+    stop_file: Path | str | None,
+) -> tuple[PacketSequenceClassifier, list[float], list[dict[str, Any]]]:
+    set_reproducible_seed(config.seed)
+    model = PacketSequenceClassifier(
+        len(classes), config.hidden_size, config.dropout, config.model_type
+    ).to(device)
+    criterion = nn.CrossEntropyLoss(weight=torch.from_numpy(weights).to(device))
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
+    )
+    loader = _dataset_loader(dataset, config, shuffle=True, seed=config.seed)
+    history = []
+    for epoch in range(1, epochs + 1):
+        loss, accuracy = _training_epoch(
+            model, loader, criterion, optimizer, device, stop_file
+        )
+        history.append({"epoch": epoch, "loss": loss, "accuracy": accuracy})
+        print(
+            f"final epoch {epoch:03d}/{epochs:03d}: loss={loss:.6f} "
+            f"accuracy={accuracy:.4f}",
+            flush=True,
+        )
+    return model, weights.tolist(), history
+
+
 def train_components(
     streams: Sequence[PacketStream],
     classes: Sequence[int],
@@ -939,6 +1618,103 @@ def train_components(
         device,
         stop_file,
     )
+    return TrainedComponents(
+        scaler=final_scaler,
+        model=model,
+        best_epoch=best_epoch,
+        validation_history=validation_history,
+        validation_assignments=assignments,
+        final_history=final_history,
+        class_weights=class_weights,
+        classes=list(classes),
+        selection_sequence_counts={
+            **{f"fit:{key}": value for key, value in fit_counts.items()},
+            **{
+                f"validation:{key}": value
+                for key, value in validation_counts.items()
+            },
+        },
+        final_sequence_counts=final_counts,
+    )
+
+
+def train_catalog_components(
+    captures: Sequence[PacketCapture],
+    classes: Sequence[int],
+    config: TrainingConfig,
+    device: torch.device,
+    stop_file: Path | str | None,
+    cache_workspace: Path,
+) -> TrainedComponents:
+    fit_raw, validation_raw, assignments = split_training_streams(
+        captures, config.validation_fraction, config.seed
+    )
+    selection_scaler = fit_packet_scaler(fit_raw)
+    fit_candidates, fit_counts = build_sequence_candidates(
+        fit_raw,
+        config.sequence_packets,
+        config.max_sequences_per_device,
+        config.seed,
+        "selection-fit",
+    )
+    validation_candidates, validation_counts = build_sequence_candidates(
+        validation_raw,
+        config.sequence_packets,
+        config.max_sequences_per_device,
+        config.seed,
+        "selection-validation",
+    )
+    selection_weights = sequence_class_weights(
+        fit_raw, fit_candidates, classes
+    )
+    with sequence_cache(
+        fit_raw,
+        fit_candidates,
+        selection_scaler,
+        config,
+        cache_workspace / "selection-fit",
+    ) as fit_dataset, sequence_cache(
+        validation_raw,
+        validation_candidates,
+        selection_scaler,
+        config,
+        cache_workspace / "selection-validation",
+    ) as validation_dataset:
+        best_epoch, validation_history = select_best_epoch_cached(
+            fit_dataset,
+            validation_dataset,
+            selection_weights,
+            classes,
+            config,
+            device,
+            stop_file,
+        )
+    print(f"selected epoch: {best_epoch}; refitting on all training packets", flush=True)
+    final_scaler = fit_packet_scaler(captures)
+    final_candidates, final_counts = build_sequence_candidates(
+        captures,
+        config.sequence_packets,
+        config.max_sequences_per_device,
+        config.seed,
+        "final-training",
+    )
+    final_weights = sequence_class_weights(captures, final_candidates, classes)
+    with sequence_cache(
+        captures,
+        final_candidates,
+        final_scaler,
+        config,
+        cache_workspace / "final-training",
+    ) as final_dataset:
+        model, class_weights, final_history = train_final_model_cached(
+            final_dataset,
+            final_weights,
+            classes,
+            best_epoch,
+            config,
+            device,
+            stop_file,
+        )
     return TrainedComponents(
         scaler=final_scaler,
         model=model,
@@ -1055,6 +1831,100 @@ def sample_unseen_sequences(
     )
 
 
+@torch.no_grad()
+def predict_cached_dataset(
+    dataset: Dataset,
+    model: PacketSequenceClassifier,
+    config: TrainingConfig,
+    device: torch.device,
+    stop_file: Path | str | None = None,
+) -> np.ndarray:
+    loader = _dataset_loader(dataset, config, shuffle=False, seed=0)
+    model.eval()
+    chunks = []
+    for values, _labels, lengths in loader:
+        common.check_stop(stop_file)
+        values = values.to(device)
+        lengths = lengths.to(device)
+        probabilities = torch.softmax(model(values, lengths), dim=-1)
+        positions = torch.arange(probabilities.shape[1], device=device)[None, :]
+        mask = positions < lengths[:, None]
+        summed = (probabilities * mask[:, :, None]).sum(dim=1)
+        chunks.append((summed / lengths[:, None]).cpu().numpy())
+    return np.concatenate(chunks).astype(np.float64, copy=False)
+
+
+def sample_unseen_catalog(
+    captures: Sequence[PacketCapture],
+    scaler: StandardScaler,
+    model: PacketSequenceClassifier,
+    classes: Sequence[int],
+    config: TrainingConfig,
+    device: torch.device,
+    test_trials: int,
+    cache_workspace: Path,
+    phase: str,
+    stop_file: Path | str | None = None,
+) -> pd.DataFrame:
+    if test_trials <= 0:
+        raise PipelineError("test trials must be positive")
+    grouped: dict[tuple[str, str], list[int]] = {}
+    for index, capture in enumerate(captures):
+        grouped.setdefault((capture.dataset, capture.device_id), []).append(index)
+    selections: list[tuple[int, SequenceCandidate, bool]] = []
+    unique: dict[SequenceCandidate, int] = {}
+    unique_candidates: list[SequenceCandidate] = []
+    rows: list[dict[str, Any]] = []
+    rng = np.random.default_rng(config.seed + 10_000)
+    for (dataset, device_id), indexes in sorted(grouped.items()):
+        indexes.sort(key=lambda index: captures[index].capture_id)
+        total = sum(
+            stream_candidate_count(captures[index], config.sequence_packets)
+            for index in indexes
+        )
+        replacement = total < test_trials
+        chosen = rng.choice(total, size=test_trials, replace=replacement)
+        for trial, ordinal in enumerate(chosen.tolist(), start=1):
+            candidate = _ordinal_candidate(
+                captures, indexes, config.sequence_packets, int(ordinal)
+            )
+            if candidate not in unique:
+                unique[candidate] = len(unique_candidates)
+                unique_candidates.append(candidate)
+            selections.append((unique[candidate], candidate, replacement))
+            capture = captures[candidate.stream_index]
+            rows.append(
+                {
+                    "trial": trial,
+                    "dataset": dataset,
+                    "device_id": device_id,
+                    "capture_id": capture.capture_id,
+                    "start_packet_index": candidate.start,
+                    "valid_length": candidate.valid_length,
+                    "replacement_required": replacement,
+                    "true_label": capture.label,
+                }
+            )
+    with sequence_cache(
+        captures,
+        unique_candidates,
+        scaler,
+        config,
+        cache_workspace / phase,
+    ) as dataset:
+        probabilities = predict_cached_dataset(
+            dataset, model, config, device, stop_file
+        )
+    for row, (prediction_index, _candidate, _replacement) in zip(rows, selections):
+        values = probabilities[prediction_index]
+        row["predicted_label"] = int(np.argmax(values))
+        for index, label in enumerate(classes):
+            row[f"probability_class_{label}"] = float(values[index])
+    return pd.DataFrame(rows).sort_values(
+        ["trial", "dataset", "device_id"], ignore_index=True
+    )
+
+
 def trial_report(
     predictions: pd.DataFrame,
     test_datasets: Sequence[str],
@@ -1111,11 +1981,11 @@ def _filter_removed_streams(
     return result
 
 
-def stream_counts(streams: Sequence[PacketStream]) -> dict[str, Any]:
+def stream_counts(streams: Sequence[PacketStream | PacketCapture]) -> dict[str, Any]:
     devices = {(stream.dataset, stream.device_id, stream.label) for stream in streams}
     return {
         "streams": len(streams),
-        "packets": int(sum(len(stream.features) for stream in streams)),
+        "packets": int(sum(_stream_packet_count(stream) for stream in streams)),
         "devices": len(devices),
         "devices_by_class": {
             str(label): sum(1 for _dataset, _device, value in devices if value == label)
@@ -1169,8 +2039,8 @@ def _load_components(
 def _execute_model_run(
     run_entry: Mapping[str, Any],
     experiment_dir: Path,
-    train_streams: Sequence[PacketStream],
-    test_streams: Sequence[PacketStream],
+    train_streams: Sequence[PacketCapture],
+    test_streams: Sequence[PacketCapture],
     unevaluable_devices: Sequence[Mapping[str, Any]],
     train_datasets: Sequence[str],
     test_datasets: Sequence[str],
@@ -1182,11 +2052,19 @@ def _execute_model_run(
     device_name: str,
     test_trials: int,
     stop_file: str | None,
+    cache_root: str,
+    cache_namespace: str,
+    scan_batch_rows: int,
 ) -> dict[str, Any]:
     run_number = int(run_entry["run"])
     run_dir, final_run_dir = common.create_model_run_staging_directory(
         experiment_dir, run_number
     )
+    cache_workspace = (
+        Path(cache_root) / cache_namespace / f"model_run_{run_number:03d}"
+    )
+    shutil.rmtree(cache_workspace, ignore_errors=True)
+    cache_workspace.mkdir(parents=True, exist_ok=True)
     common.atomic_write_json(run_dir / "_run_manifest.json", {"status": "running"})
     try:
         common.check_stop(stop_file)
@@ -1199,8 +2077,10 @@ def _execute_model_run(
             f"torch_device={device}",
             flush=True,
         )
-        components = train_components(reduced, classes, config, device, stop_file)
-        predictions = sample_unseen_sequences(
+        components = train_catalog_components(
+            reduced, classes, config, device, stop_file, cache_workspace
+        )
+        predictions = sample_unseen_catalog(
             test_streams,
             components.scaler,
             components.model,
@@ -1208,6 +2088,8 @@ def _execute_model_run(
             config,
             device,
             test_trials,
+            cache_workspace,
+            "unseen-test",
             stop_file,
         )
         predictions.insert(0, "model_run", run_number)
@@ -1248,6 +2130,12 @@ def _execute_model_run(
             "selection_sequence_counts": components.selection_sequence_counts,
             "final_sequence_counts": components.final_sequence_counts,
             "torch_device": str(device),
+            "data_access": {
+                "version": DATA_ACCESS_VERSION,
+                "mode": "streamed_catalog_disk_sequence_cache",
+                "scan_batch_rows": scan_batch_rows,
+                "peak_rss_bytes": peak_rss_bytes(),
+            },
             "versions": {
                 "python": platform.python_version(),
                 "numpy": np.__version__,
@@ -1290,7 +2178,7 @@ def _execute_model_run(
         reloaded_scaler, reloaded_model, reloaded_classes, reloaded_config = (
             _load_components(run_dir, device)
         )
-        reloaded_predictions = sample_unseen_sequences(
+        reloaded_predictions = sample_unseen_catalog(
             test_streams,
             reloaded_scaler,
             reloaded_model,
@@ -1298,6 +2186,8 @@ def _execute_model_run(
             reloaded_config,
             device,
             test_trials,
+            cache_workspace,
+            "artifact-reload-test",
         )
         expected = predictions.drop(columns=["model_run"]).reset_index(drop=True)
         if not np.array_equal(
@@ -1324,6 +2214,7 @@ def _execute_model_run(
                 "test_trials": test_trials,
                 "artifact_reload_verified": True,
                 "training_counts_after_removal": stream_counts(reduced),
+                "peak_rss_bytes": peak_rss_bytes(),
             },
         )
         common.check_stop(stop_file)
@@ -1340,6 +2231,8 @@ def _execute_model_run(
     except BaseException:
         common.discard_model_run(run_dir)
         raise
+    finally:
+        shutil.rmtree(cache_workspace, ignore_errors=True)
 
 
 def _load_completed_result(run_dir: Path) -> dict[str, Any]:
@@ -1364,6 +2257,33 @@ def _load_completed_result(run_dir: Path) -> dict[str, Any]:
             "records"
         ),
     }
+
+
+def _capped_candidate_total(
+    captures: Sequence[PacketCapture], config: TrainingConfig
+) -> int:
+    grouped: dict[tuple[str, str], int] = {}
+    for capture in captures:
+        key = (capture.dataset, capture.device_id)
+        grouped[key] = grouped.get(key, 0) + stream_candidate_count(
+            capture, config.sequence_packets
+        )
+    return sum(min(total, config.max_sequences_per_device) for total in grouped.values())
+
+
+def estimated_peak_cache_bytes(
+    train_captures: Sequence[PacketCapture],
+    test_captures: Sequence[PacketCapture],
+    config: TrainingConfig,
+    test_trials: int,
+    jobs: int,
+) -> int:
+    train_candidates = _capped_candidate_total(train_captures, config)
+    test_devices = len({(item.dataset, item.device_id) for item in test_captures})
+    per_run_candidates = max(train_candidates * 2, test_devices * test_trials)
+    return sequence_cache_bytes(
+        per_run_candidates * max(1, jobs), config.sequence_packets
+    )
 
 
 def execute_experiment(args: argparse.Namespace) -> Path:
@@ -1398,6 +2318,9 @@ def execute_experiment(args: argparse.Namespace) -> Path:
         raise PipelineError("dropout must be in [0, 1)")
     if args.test_trials <= 0 or args.jobs <= 0:
         raise PipelineError("test trials and jobs must be positive")
+    scan_batch_rows = int(getattr(args, "scan_batch_rows", DEFAULT_SCAN_BATCH_ROWS))
+    if scan_batch_rows <= 0:
+        raise PipelineError("scan batch rows must be positive")
     stop_file = args.stop_file.resolve() if args.stop_file else None
     removal_specs = common.parse_removal_specs(args.remove_devices, train_datasets)
     experiment_dir = args.output_root.resolve() / common.experiment_directory_name(
@@ -1416,13 +2339,30 @@ def execute_experiment(args: argparse.Namespace) -> Path:
         [*train_datasets, *test_datasets],
     )
     print(f"selected torch device: {device} ({torch_device_description(device)})")
-    print(f"loading training datasets: {', '.join(train_datasets)}", flush=True)
-    train = load_packet_datasets(
-        train_datasets, features_root, labels_root, label_file
+    print(f"streaming training catalog: {', '.join(train_datasets)}", flush=True)
+    train = load_packet_catalog(
+        train_datasets,
+        features_root,
+        labels_root,
+        label_file,
+        scan_batch_rows=scan_batch_rows,
+        stop_file=stop_file,
     )
     common.check_stop(stop_file)
-    print(f"loading test datasets: {', '.join(test_datasets)}", flush=True)
-    test = load_packet_datasets(test_datasets, features_root, labels_root, label_file)
+    print(f"streaming test catalog: {', '.join(test_datasets)}", flush=True)
+    test = load_packet_catalog(
+        test_datasets,
+        features_root,
+        labels_root,
+        label_file,
+        scan_batch_rows=scan_batch_rows,
+        stop_file=stop_file,
+    )
+    print(
+        f"catalog complete: training_rows={train.total_rows:,}; "
+        f"test_rows={test.total_rows:,}; peak_rss={peak_rss_bytes() / (1024**3):.2f} GiB",
+        flush=True,
+    )
     classes = common.validate_class_sets(train.device_frame, test.device_frame)
     removal_plan = common.generate_removal_plan(
         train.device_frame, removal_specs, args.removal_runs, config.seed
@@ -1447,6 +2387,17 @@ def execute_experiment(args: argparse.Namespace) -> Path:
         overwrite=args.overwrite,
         fingerprint=fingerprint,
     )
+    supplied_cache_root = getattr(args, "cache_root", None)
+    cache_root = (
+        Path(supplied_cache_root).resolve()
+        if supplied_cache_root is not None
+        else experiment_dir / ".sequence-cache"
+    )
+    cache_namespace = fingerprint[:16]
+    cache_estimate = estimated_peak_cache_bytes(
+        train.captures, test.captures, config, args.test_trials, args.jobs
+    )
+    _check_cache_space(cache_root, cache_estimate)
     manifest: dict[str, Any] = {
         "status": "running",
         "pipeline": "packet_sequence_lstm_v2",
@@ -1463,6 +2414,15 @@ def execute_experiment(args: argparse.Namespace) -> Path:
         "classes": classes,
         "label_file": label_file,
         "configuration_fingerprint": fingerprint,
+        "data_access": {
+            "version": DATA_ACCESS_VERSION,
+            "mode": "streamed_catalog_disk_sequence_cache",
+            "scan_batch_rows": scan_batch_rows,
+            "training_packet_rows": train.total_rows,
+            "test_packet_rows": test.total_rows,
+            "estimated_peak_cache_bytes": cache_estimate,
+            "catalog_peak_rss_bytes": peak_rss_bytes(),
+        },
     }
     common.atomic_write_json(experiment_dir / "_run_manifest.json", manifest)
     common.atomic_write_json(experiment_dir / "removal_plan.json", removal_plan)
@@ -1475,6 +2435,8 @@ def execute_experiment(args: argparse.Namespace) -> Path:
             "output_root": str(args.output_root.resolve()),
             "jobs": args.jobs,
             "stop_file": str(stop_file) if stop_file else None,
+            "cache_root": str(cache_root),
+            "scan_batch_rows": scan_batch_rows,
         },
     )
     results: dict[int, dict[str, Any]] = {}
@@ -1499,8 +2461,8 @@ def execute_experiment(args: argparse.Namespace) -> Path:
 
     worker_args = (
         experiment_dir,
-        train.streams,
-        test.streams,
+        train.captures,
+        test.captures,
         test.unevaluable_devices,
         train_datasets,
         test_datasets,
@@ -1512,6 +2474,9 @@ def execute_experiment(args: argparse.Namespace) -> Path:
         str(device),
         args.test_trials,
         str(stop_file) if stop_file else None,
+        str(cache_root),
+        cache_namespace,
+        scan_batch_rows,
     )
 
     def completed(result: dict[str, Any]) -> None:
@@ -1606,6 +2571,8 @@ def execute_experiment(args: argparse.Namespace) -> Path:
         )
         common.atomic_write_json(experiment_dir / "_run_manifest.json", manifest)
         raise
+    finally:
+        shutil.rmtree(cache_root / cache_namespace, ignore_errors=True)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -1632,6 +2599,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=0.5)
     parser.add_argument("--max-sequences-per-device", type=int, default=5_000)
     parser.add_argument("--loader-workers", type=int, default=0)
+    parser.add_argument(
+        "--scan-batch-rows",
+        type=int,
+        default=DEFAULT_SCAN_BATCH_ROWS,
+        help="maximum packet rows retained during streamed validation",
+    )
+    parser.add_argument(
+        "--cache-root",
+        type=Path,
+        help="temporary disk-backed sequence cache (defaults inside the experiment)",
+    )
     parser.add_argument(
         "--device", choices=("auto", "cpu", "cuda", "mps", "xpu"), default="auto"
     )
